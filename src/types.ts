@@ -83,6 +83,10 @@ export interface WorkspaceSettings {
 export interface WorkspaceState {
   version: 1
   widgets: DesktopWidget[]
+  desktopLayout?: {
+    virtualBounds: { x: number; y: number; width: number; height: number }
+    displays: DesktopInfo['displays']
+  } | null
   settings: WorkspaceSettings
 }
 

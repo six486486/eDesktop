@@ -26,6 +26,19 @@ const mapping = buildDisplayMapping(sourceDisplays, targetDisplays)
 assert.equal(mapping.mapping.get('left-old').id, 'right-new', 'display labels should survive topology changes')
 assert.equal(mapping.mapping.get('main-old').id, 'main-new', 'primary display label should map to the new primary')
 
+const swappedMapping = buildDisplayMapping(
+  [
+    { id: 'laptop', label: 'Laptop', primary: true, bounds: { x: 0, y: 0, width: 1463, height: 867 } },
+    { id: 'external', label: 'External', primary: false, bounds: { x: 1463, y: 0, width: 2048, height: 1104 } },
+  ],
+  [
+    { id: 'laptop', label: 'Laptop', primary: false, bounds: { x: 0, y: 0, width: 1463, height: 867 } },
+    { id: 'external', label: 'External', primary: true, bounds: { x: 1463, y: 0, width: 2048, height: 1104 } },
+  ],
+)
+assert.equal(swappedMapping.mapping.get('laptop').id, 'external', 'the former primary layout should follow the new primary display')
+assert.equal(swappedMapping.mapping.get('external').id, 'laptop', 'the remaining display should keep a one-to-one mapping')
+
 const remapped = remapWorkspaceLayout(workspace, sourceDisplays, targetDisplays)
 const leftWidget = remapped.workspace.widgets.find((widget) => widget.id === 'left-widget')
 const mainWidget = remapped.workspace.widgets.find((widget) => widget.id === 'main-widget')

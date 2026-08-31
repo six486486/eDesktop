@@ -624,6 +624,36 @@ public static class DesktopIconNative
         }
     }
 
+    public static DesktopWindowGeometryInfo SetWindowClientBounds(
+        string rawHandle,
+        int x,
+        int y,
+        int width,
+        int height
+    )
+    {
+        IntPtr previousContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        try
+        {
+            IntPtr handle = ParseWindowHandle(rawHandle);
+            if (handle == IntPtr.Zero || !IsWindow(handle)) return ReadWindowGeometry(handle);
+            SetWindowPos(
+                handle,
+                IntPtr.Zero,
+                x,
+                y,
+                Math.Max(1, width),
+                Math.Max(1, height),
+                SWP_NOZORDER | SWP_NOACTIVATE
+            );
+            return ReadWindowGeometry(handle);
+        }
+        finally
+        {
+            if (previousContext != IntPtr.Zero) SetThreadDpiAwarenessContext(previousContext);
+        }
+    }
+
     public static DesktopWindowGeometryInfo ResizeRenderChildForDpi(string rawHandle, int logicalWidth, int logicalHeight)
     {
         IntPtr previousContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1321,6 +1351,14 @@ if ($Mode -eq 'server') {
           [string]$request.hwnd,
           [int]$request.logicalWidth,
           [int]$request.logicalHeight
+        )
+      } elseif ($request.command -eq 'set-window-client-bounds') {
+        $result = [DesktopIconNative]::SetWindowClientBounds(
+          [string]$request.hwnd,
+          [int]$request.x,
+          [int]$request.y,
+          [int]$request.width,
+          [int]$request.height
         )
       } elseif ($request.command -eq 'resize-render-child-for-dpi') {
         $result = [DesktopIconNative]::ResizeRenderChildForDpi(

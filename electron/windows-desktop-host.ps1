@@ -28,6 +28,11 @@ param(
   [Int32]$DirectDragEndClientX = -1,
   [Int32]$DirectDragEndClientY = -1,
   [Int32]$DirectDragSteps = 12,
+  [Int32]$SetClientX = -1,
+  [Int32]$SetClientY = -1,
+  [Int32]$SetClientWidth = -1,
+  [Int32]$SetClientHeight = -1,
+  [Double]$ClientScale = 1.0,
   [switch]$DisplaceOrganizerBand
 )
 
@@ -140,6 +145,9 @@ public static class DesktopHostNative
 
     [DllImport("user32.dll")]
     public static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
 
     [DllImport("user32.dll")]
     public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
@@ -276,6 +284,48 @@ public static class DesktopHostNative
 Add-Type -TypeDefinition $source -Language CSharp
 
 $window = [IntPtr]::new([Int64]$Hwnd)
+# Every coordinate handled below crosses a process boundary between eDesktop
+# and Explorer. PowerShell is otherwise only system-DPI aware, so Windows can
+# virtualize GetWindowRect/ScreenToClient/SetWindowPos with different scale
+# factors when the primary display changes. That double conversion displaced
+# a desktop-child host while leaving its Chromium children visually composed
+# outside the parent's hit-test rectangle. Keep the complete native operation
+# in one physical, per-monitor-aware coordinate space.
+[void][DesktopHostNative]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
+
+# Renderer event coordinates are CSS DIPs, while ClientToScreen expects
+# physical client pixels in a PMv2 helper. Organizer HWNDs inherit Explorer's
+# primary DPI after SetParent even when Chromium is rendering for a differently
+# scaled monitor, so use the renderer's target display scale explicitly.
+if ($ClientScale -gt 0 -and [Math]::Abs($ClientScale - 1.0) -gt 0.001) {
+  foreach ($name in @(
+    'HoverClientX', 'HoverClientY',
+    'InputHealthClientX', 'InputHealthClientY',
+    'DragStartClientX', 'DragStartClientY', 'DragEndClientX', 'DragEndClientY',
+    'ClickClientX', 'ClickClientY',
+    'DirectClickClientX', 'DirectClickClientY',
+    'DirectDragStartClientX', 'DirectDragStartClientY', 'DirectDragEndClientX', 'DirectDragEndClientY'
+  )) {
+    $value = Get-Variable -Name $name -ValueOnly
+    if ($value -ge 0) {
+      Set-Variable -Name $name -Value ([Math]::Round($value * $ClientScale))
+    }
+  }
+}
+
+if ($SetClientX -ge 0 -or $SetClientY -ge 0 -or $SetClientWidth -ge 0 -or $SetClientHeight -ge 0) {
+  if ($SetClientX -lt 0 -or $SetClientY -lt 0 -or $SetClientWidth -le 0 -or $SetClientHeight -le 0) {
+    throw 'A complete positive parent-client rectangle is required.'
+  }
+  $flags = [DesktopHostNative]::SWP_NOZORDER -bor [DesktopHostNative]::SWP_NOACTIVATE -bor [DesktopHostNative]::SWP_SHOWWINDOW -bor [DesktopHostNative]::SWP_FRAMECHANGED
+  if (-not [DesktopHostNative]::SetWindowPos($window, [IntPtr]::Zero, $SetClientX, $SetClientY, $SetClientWidth, $SetClientHeight, $flags)) {
+    throw 'Unable to set the parent-client rectangle.'
+  }
+  $actualRect = New-Object DesktopHostNative+RECT
+  [void][DesktopHostNative]::GetWindowRect($window, [ref]$actualRect)
+  Write-Output ('client-bounds hwnd={0} requested={1},{2},{3},{4} actual-screen={5},{6},{7},{8}' -f $window.ToInt64(), $SetClientX, $SetClientY, $SetClientWidth, $SetClientHeight, $actualRect.Left, $actualRect.Top, $actualRect.Right, $actualRect.Bottom)
+  exit 0
+}
 
 if ($DisplaceOrganizerBand) {
   $hostWindow = [DesktopHostNative]::FindDesktopIconHost()

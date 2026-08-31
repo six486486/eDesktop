@@ -7,10 +7,11 @@ Set-StrictMode -Version Latest
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $packageJsonPath = Join-Path $projectRoot 'package.json'
-$packageJson = Get-Content -LiteralPath $packageJsonPath -Raw | ConvertFrom-Json
+$packageJsonText = [System.IO.File]::ReadAllText($packageJsonPath, [System.Text.Encoding]::UTF8)
+$packageJson = $packageJsonText | ConvertFrom-Json
 $packageDirectory = Join-Path $projectRoot 'out\eDesktop-win32-x64'
 $portableDirectory = Join-Path $projectRoot 'out\portable'
-$archiveName = "eDesktop-$($packageJson.version)-win-x64-portable.zip"
+$archiveName = "eDesktop-$($packageJson.version)-windows-x64.zip"
 $archivePath = Join-Path $portableDirectory $archiveName
 $checksumPath = "$archivePath.sha256"
 
@@ -35,7 +36,9 @@ try {
   [void]$currentPortableFiles.Add([System.IO.Path]::GetFullPath($archivePath))
   [void]$currentPortableFiles.Add([System.IO.Path]::GetFullPath($checksumPath))
   foreach ($existingPortable in @(Get-ChildItem -LiteralPath $portableDirectory -File | Where-Object {
-    ($_.Name -like 'eDesktop-*-win-x64-portable.zip') -or
+    ($_.Name -like 'eDesktop-*-windows-x64.zip') -or
+      ($_.Name -like 'eDesktop-*-windows-x64.zip.sha256') -or
+      ($_.Name -like 'eDesktop-*-win-x64-portable.zip') -or
       ($_.Name -like 'eDesktop-*-win-x64-portable.zip.sha256')
   })) {
     $resolvedExisting = [System.IO.Path]::GetFullPath($existingPortable.FullName)

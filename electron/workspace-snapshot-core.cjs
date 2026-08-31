@@ -40,6 +40,12 @@ const buildDisplayMapping = (sourceDisplays, targetDisplays) => {
     return true
   }
 
+  // A layout created on the primary display follows the primary role when the
+  // user changes which physical monitor is primary. Mapping exact ids first
+  // left the whole workspace on the former primary after a dock/undock cycle.
+  const sourcePrimary = sources.find((display) => display.primary)
+  if (sourcePrimary && targetPrimary) assign(sourcePrimary, targetPrimary)
+
   for (const source of sources) {
     const exact = targets.find((target) => unusedTargets.has(target.id) && target.id === source.id)
     if (exact) assign(source, exact)
@@ -52,9 +58,6 @@ const buildDisplayMapping = (sourceDisplays, targetDisplays) => {
     ))
     if (labelMatch) assign(source, labelMatch)
   }
-  const sourcePrimary = sources.find((display) => display.primary && !mapping.has(display.id))
-  if (sourcePrimary && targetPrimary && unusedTargets.has(targetPrimary.id)) assign(sourcePrimary, targetPrimary)
-
   for (const source of sources.filter((display) => !mapping.has(display.id))) {
     const candidates = targets.filter((target) => unusedTargets.has(target.id))
     const best = candidates.sort((left, right) => displayDistance(source, left) - displayDistance(source, right))[0]
