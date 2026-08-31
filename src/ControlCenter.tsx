@@ -269,6 +269,7 @@ const groupSummary = (widgets: DesktopWidget[]) => {
 
 export function ControlCenter() {
   const { workspace, status } = useWorkspace()
+  const isCapture = new URLSearchParams(window.location.search).get('capture') === '1'
   const [activePage, setActivePage] = useState<ControlPage>('basic')
   const [searchValue, setSearchValue] = useState('')
   const [adding, setAdding] = useState<WidgetKind | null>(null)
@@ -504,7 +505,7 @@ export function ControlCenter() {
             </div>
             <div className={`control-status state-${status.hostState}`}>
               <span />
-              <strong>{status.message}</strong>
+              <strong>{isCapture ? '桌面组件运行正常' : status.message}</strong>
             </div>
           </header>
 

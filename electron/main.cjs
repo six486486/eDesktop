@@ -24,6 +24,7 @@ installSafeConsole()
 const execFileAsync = promisify(execFile)
 const capturePath = process.env.EDESKTOP_CAPTURE_PATH
 const captureSurface = process.env.EDESKTOP_CAPTURE_SURFACE === 'desktop' ? 'desktop' : 'control'
+let captureFixtureRoot = null
 const desktopHostTest = process.env.EDESKTOP_HOST_TEST === '1'
 const desktopHostTestDemo = process.env.EDESKTOP_HOST_TEST_DEMO === '1'
 const desktopHostRegressionTest = process.env.EDESKTOP_HOST_TEST_REGRESSION === '1'
@@ -1622,7 +1623,7 @@ const loadWorkspace = async () => {
     workspaceState = defaultWorkspace()
   }
 
-  if ((capturePath && captureSurface === 'desktop') || desktopHostTestDemo) {
+  if (capturePath || desktopHostTestDemo) {
     workspaceState.widgets = createCaptureWidgets()
     if (desktopWidgetWindowTest || desktopOrganizerPromotionTest) {
       const firstOrganizer = workspaceState.widgets.find((widget) => widget.kind === 'organizer')
@@ -3231,6 +3232,28 @@ const createCaptureWidgets = () => {
   organizer.y = primaryOffset.y + 130
   organizer.width = 390
   organizer.height = 280
+  if (capturePath) {
+    captureFixtureRoot = path.join(app.getPath('temp'), `edesktop-capture-${process.pid}`)
+    const fixturePaths = ['项目文档', '参考资料', '待处理', '已归档'].map((name) => {
+      const fixturePath = path.join(captureFixtureRoot, name)
+      fs.mkdirSync(fixturePath, { recursive: true })
+      return fixturePath
+    })
+    organizer.data.files = fixturePaths.map((fixturePath) => {
+      const fixtureStat = fs.statSync(fixturePath)
+      return {
+        id: Buffer.from(fixturePath.toLowerCase()).toString('base64url'),
+        path: fixturePath,
+        name: path.basename(fixturePath),
+        extension: fixtureStat.isDirectory() ? '' : path.extname(fixturePath).slice(1),
+        size: fixtureStat.size,
+        isDirectory: fixtureStat.isDirectory(),
+        modifiedAt: fixtureStat.mtime.toISOString(),
+        originalPath: fixturePath,
+        originalDesktopPosition: null,
+      }
+    })
+  }
   if (desktopDragTest || desktopWidgetWindowTest) {
     const fixtureDirectory = organizerStoragePath(organizer.id)
     fs.mkdirSync(fixtureDirectory, { recursive: true })
@@ -5283,6 +5306,16 @@ const captureWindow = (win) => {
               if (!button) return false
               button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
               await new Promise((resolve) => setTimeout(resolve, 200))
+              for (const element of [
+                document.scrollingElement,
+                document.documentElement,
+                document.body,
+                document.querySelector('.control-page-scroll'),
+              ]) {
+                if (!element) continue
+                element.scrollTop = 0
+                element.scrollLeft = 0
+              }
               return {
                 active: document.querySelector('.control-navigation .is-active span')?.textContent || '',
                 heading: document.querySelector('.control-page-heading h1')?.textContent || '',
@@ -5303,6 +5336,10 @@ const captureWindow = (win) => {
         await fs.promises.writeFile(outputPath, image.toPNG())
         console.log(`[capture] wrote ${outputPath}`)
       } finally {
+        if (captureFixtureRoot) {
+          await fs.promises.rm(captureFixtureRoot, { recursive: true, force: true }).catch(() => {})
+          captureFixtureRoot = null
+        }
         app.quit()
       }
     }, 1800)

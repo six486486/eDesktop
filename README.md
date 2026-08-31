@@ -4,6 +4,20 @@ eDesktop 是一个 Windows 桌面整理工具。我写它的初衷很简单：�
 
 它可以把文件、快捷方式和常用的系统图标放进桌面收纳盒，也提供便签、待办列表和番茄钟。所有组件都贴在桌面壁纸层，不会像普通窗口一样挡在其他软件前面。
 
+## 界面预览
+
+桌面组件：收纳盒、便签、待办列表和番茄钟都可以独立摆放。
+
+![eDesktop 桌面组件](docs/screenshots/desktop-components.png)
+
+控制中心：创建组件、修改设置和管理快照都在这里完成。
+
+![eDesktop 控制中心](docs/screenshots/control-center.png)
+
+已有组件会按类型归类，组件多的时候也比较容易查找。
+
+![eDesktop 组件管理](docs/screenshots/control-center-widgets.png)
+
 ## 能做什么
 
 - 用收纳盒整理桌面文件、快捷方式和文件夹
