@@ -1,0 +1,65 @@
+{
+  "name": "edesktop",
+  "productName": "eDesktop",
+  "version": "0.1.41",
+  "private": true,
+  "description": "Windows 10/11 桌面整理与效率工具",
+  "author": "six486486",
+  "license": "MIT",
+  "homepage": "https://github.com/six486486/eDesktop#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/six486486/eDesktop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/six486486/eDesktop/issues"
+  },
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k -n WEB,APP -c yellow,cyan \"vite\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "dev:web": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "generate:icon": "node scripts/generate-app-icon.cjs",
+    "prepare:electron-runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-electron-runtime.ps1",
+    "package:win": "npm run generate:icon && npm run prepare:electron-runtime && npm run build && electron-forge package --platform=win32 --arch=x64",
+    "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-portable.ps1",
+    "make:win": "npm run generate:icon && npm run prepare:electron-runtime && npm run build && electron-forge make --platform=win32 --arch=x64",
+    "start": "electron .",
+    "capture": "npm run build && cross-env EDESKTOP_CAPTURE_PATH=.artifacts/control-center.png EDESKTOP_CAPTURE_SURFACE=control electron .",
+    "capture:desktop": "npm run build && cross-env EDESKTOP_CAPTURE_PATH=.artifacts/desktop-layer.png EDESKTOP_CAPTURE_SURFACE=desktop electron .",
+    "test:desktop-host": "npm run build && cross-env EDESKTOP_HOST_TEST=1 EDESKTOP_HOST_TEST_DEMO=1 EDESKTOP_HOST_TEST_REGRESSION=1 electron .",
+    "test:widget-zorder": "npm run build && cross-env EDESKTOP_HOST_TEST=1 EDESKTOP_HOST_TEST_DEMO=1 EDESKTOP_WIDGET_WINDOW_TEST=1 electron .",
+    "test:organizer-promotion": "npm run build && cross-env EDESKTOP_HOST_TEST=1 EDESKTOP_HOST_TEST_DEMO=1 EDESKTOP_ORGANIZER_PROMOTION_TEST=1 electron .",
+    "test:drag-out": "npm run build && cross-env EDESKTOP_HOST_TEST=1 EDESKTOP_HOST_TEST_DEMO=1 EDESKTOP_DRAG_TEST=1 electron .",
+    "test:login-item": "node scripts/test-login-item-path.cjs",
+    "test:restore-guardian": "node scripts/test-restore-guardian.cjs",
+    "test:desktop-icon-layout": "node scripts/test-desktop-icon-layout.cjs",
+    "test:snapshots": "node scripts/test-workspace-snapshots.cjs",
+    "test:snapshots:integration": "node scripts/test-workspace-snapshot-integration.cjs",
+    "test:icon": "npm run generate:icon && node scripts/test-electron-icon.cjs",
+    "test:icon:packaged": "node scripts/test-electron-icon.cjs out/eDesktop-win32-x64/eDesktop.exe",
+    "test:safe-console": "node scripts/test-safe-console.cjs",
+    "test:safe-console:electron": "node scripts/test-electron-safe-console.cjs"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.6",
+    "@fontsource/inter-tight": "^5.2.6",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.11.2",
+    "@electron-forge/maker-squirrel": "^7.11.2",
+    "@types/react": "^19.0.3",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^39.8.5",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.7",
+    "wait-on": "^8.0.1"
+  }
+}

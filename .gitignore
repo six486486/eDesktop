@@ -1,0 +1,12 @@
+node_modules/
+dist/
+out/
+.artifacts/
+.electron-dist-cache/
+.superdesign/
+.env
+.env.*
+!.env.example
+UI风格参考/
+*.log
+*.tsbuildinfo
