@@ -51,6 +51,10 @@ assert.match(mainSource, /if \(ipcHandlersRegistered && !desktopTopologyTransiti
 assert.match(mainSource, /confirmedTopologyChange\) await rebuildDesktopWidgetWindowsForTopology\(revision\)/)
 assert.match(mainSource, /const oldWindows = liveDesktopWidgetWindows\(\)/)
 assert.match(mainSource, /if \(desktopTopologyTransitionRevision\) return\s+if \(process\.platform !== 'darwin'\) app\.quit\(\)/)
+assert.match(mainSource, /createDesktopWidgetWindows\(\)\s+createControlWindow\(\)\s+scheduleOrganizerStorageReconcileRetry\(\)/)
+assert.match(mainSource, /startup collection deferred until all .* component surfaces are visible/)
+assert.match(mainSource, /persistOrganizerReconcileFileProgress/)
+assert.match(mainSource, /primary workspace unavailable; recovered latest safety snapshot/)
 assert.match(mainSource, /ipcHandlersRegistered = true/)
 
 console.log('[desktop-shell-visibility] state migration + event guard + startup sequencing + no Explorer restart assertions passed')

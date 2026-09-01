@@ -63,6 +63,15 @@ assert.deepEqual(
   'an unchanged topology must not nudge an already arranged workspace',
 )
 
+assert.equal(
+  workspaceLayoutSignature(sourceDisplays),
+  workspaceLayoutSignature(sourceDisplays.map((display, index) => ({
+    ...display,
+    id: `new-session-id-${index}`,
+  }))),
+  'Windows display id churn after a reboot must not invalidate a saved topology profile',
+)
+
 const denseDisplay = { id: 'wide', label: 'Wide', primary: true, scaleFactor: 1.25, bounds: { x: 1463, y: 0, width: 2048, height: 1104 } }
 const compactDisplay = { id: 'compact', label: 'Compact', primary: true, scaleFactor: 1.75, bounds: { x: 0, y: 0, width: 1463, height: 867 } }
 const denseWorkspace = {

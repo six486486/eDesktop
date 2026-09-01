@@ -96,6 +96,20 @@ export interface WorkspaceState {
     widgetFrames: Array<Pick<DesktopWidget, 'id' | 'x' | 'y' | 'width' | 'height'>>
     updatedAt?: string
   }>
+  desktopIconLayoutProfiles?: Array<{
+    signature: string
+    desktopLayout: {
+      virtualBounds: { x: number; y: number; width: number; height: number }
+      displays: DesktopInfo['displays']
+    }
+    positions: Array<{
+      widgetId: string
+      fileId: string
+      x: number
+      y: number
+    }>
+    updatedAt?: string
+  }>
   settings: WorkspaceSettings
 }
 

@@ -289,6 +289,7 @@ const defaultWorkspace = () => ({
   widgets: [],
   desktopLayout: null,
   desktopLayoutProfiles: [],
+  desktopIconLayoutProfiles: [],
   settings: {
     desktopEnabled: true,
     launchAtLogin: false,
@@ -1550,12 +1551,16 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
   if (!workspaceState?.widgets) return { restored: 0, errors: [] }
   const preserveOrganizerMembership = options.preserveOrganizerMembership === true
   const nextState = cloneWorkspace()
+  const topologyPositions = currentDesktopIconPositionMap()
+  const positionFor = (widget, file) => (
+    topologyPositions.get(`${widget.id}:${file.id}`) || file.originalDesktopPosition || null
+  )
   const hasDesktopRestorations = nextState.widgets
     .filter((candidate) => candidate.kind === 'organizer')
     .some((widget) => (Array.isArray(widget.data?.files) ? widget.data.files : []).some((file) => {
       if (isOrganizerShellItem(file)) return true
       const filePath = path.resolve(file.path)
-      return Boolean(file.originalDesktopPosition)
+      return Boolean(positionFor(widget, file))
         && fs.existsSync(filePath)
         && pathIsInside(organizerStoragePath(widget.id), filePath)
     }))
@@ -1595,10 +1600,11 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
           const update = await setDesktopShellItemVisibility(file.shellClsid, visibility)
           shellVisibilityChanged = shellVisibilityChanged || update.changed
           shellVisibilityRestorations.push({ definition, visibility })
-          if (definition && file.originalDesktopPosition) {
+          const savedPosition = positionFor(widget, file)
+          if (definition && savedPosition) {
             iconRestorations.push({
               names: [...new Set([file.name, ...definition.aliases].map((name) => name.toLocaleLowerCase()))],
-              position: file.originalDesktopPosition,
+              position: savedPosition,
               required: true,
             })
           }
@@ -1630,10 +1636,11 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
           destinationPath,
           isDirectory: stat.isDirectory(),
         })
-        if (pathIsDesktopItem(destinationPath) && file.originalDesktopPosition) {
+        const savedPosition = positionFor(widget, file)
+        if (pathIsDesktopItem(destinationPath) && savedPosition) {
           iconRestorations.push({
             names: desktopIconNamesForPath(destinationPath, stat.isDirectory()),
-            position: file.originalDesktopPosition,
+            position: savedPosition,
             required: true,
           })
         }
@@ -1673,10 +1680,38 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
   return { restored, removedReferences, errors }
 }
 
+const persistOrganizerReconcileFileProgress = async (
+  widgetId,
+  previousFileId,
+  reconciledFile,
+  rollbackMove = null,
+) => {
+  const liveWidget = workspaceState?.widgets?.find((widget) => widget.id === widgetId && widget.kind === 'organizer')
+  const liveFiles = Array.isArray(liveWidget?.data?.files) ? liveWidget.data.files : []
+  const liveIndex = liveFiles.findIndex((file) => file.id === previousFileId)
+  if (liveIndex < 0) return
+  const previousFile = liveFiles[liveIndex]
+  liveFiles[liveIndex] = reconciledFile
+  liveWidget.data = { ...liveWidget.data, files: liveFiles }
+  try {
+    // Persist immediately after the filesystem move. A later shell refresh or
+    // another widget failing must never turn this successfully moved item into
+    // an orphan that loses its original position and icon metadata.
+    await persistWorkspace()
+  } catch (error) {
+    liveFiles[liveIndex] = previousFile
+    liveWidget.data = { ...liveWidget.data, files: liveFiles }
+    if (typeof rollbackMove === 'function') await rollbackMove().catch(() => {})
+    throw error
+  }
+}
+
 const reconcileOrganizerStorage = async () => {
   if (!workspaceState?.widgets) return false
+  const iconProfileChanged = await captureCurrentDesktopIconLayoutProfile()
+  if (iconProfileChanged) await persistWorkspace()
   const nextState = cloneWorkspace()
-  let changed = false
+  let changed = iconProfileChanged
   const shellMoves = []
   const hasDesktopReconcileMutations = nextState.widgets
     .filter((candidate) => candidate.kind === 'organizer')
@@ -1769,6 +1804,14 @@ const reconcileOrganizerStorage = async () => {
             originalDesktopPosition: currentDesktopPosition || file.originalDesktopPosition || null,
           }
           delete restoredFile.temporarilyRestoredOnExit
+          await persistOrganizerReconcileFileProgress(
+            widget.id,
+            file.id,
+            restoredFile,
+            destinationPath !== filePath
+              ? () => movePath(destinationPath, filePath, { notifyShell: false })
+              : null,
+          )
           retainedFiles.push(restoredFile)
           changed = true
         } catch (error) {
@@ -1819,39 +1862,220 @@ const hasPendingOrganizerStorageReconcile = () => Boolean(workspaceState?.widget
 )))
 
 const scheduleOrganizerStorageReconcileRetry = (attempt = 0) => {
-  if (capturePath || desktopHostTest || desktopTrayTest || !hasPendingOrganizerStorageReconcile()) return
-  const delays = [500, 1_500, 4_000, 10_000]
+  if (capturePath || desktopHostTest || desktopTrayTest || !workspaceState?.settings.desktopEnabled) return
+  const delays = [0, 500, 1_500, 4_000, 10_000, 20_000]
   if (attempt >= delays.length) return
   if (organizerStorageReconcileRetryTimer) clearTimeout(organizerStorageReconcileRetryTimer)
-  organizerStorageReconcileRetryTimer = setTimeout(() => {
+  organizerStorageReconcileRetryTimer = setTimeout(async () => {
     organizerStorageReconcileRetryTimer = null
-    void enqueueWorkspaceMutation(() => reconcileOrganizerStorage())
-      .catch((error) => console.warn(`[organizer] startup reconcile retry failed: ${error.message}`))
-      .finally(() => {
-        if (hasPendingOrganizerStorageReconcile()) scheduleOrganizerStorageReconcileRetry(attempt + 1)
+    const expectedVisibleWidgets = workspaceState.widgets.filter((widget) => !widget.hidden)
+    const windows = liveDesktopWidgetWindows()
+    const windowsById = new Map(windows.map((win) => [win.desktopWidgetId, win]))
+    const surfacesReady = expectedVisibleWidgets.every((widget) => {
+      const win = windowsById.get(widget.id)
+      return Boolean(
+        win
+        && !win.isDestroyed()
+        && win.desktopFirstFrameRevealed
+        && (widget.kind !== 'organizer' || win.desktopOrganizerChildAttached === true)
+      )
+    })
+    if (!surfacesReady) {
+      await attachMissingDesktopWindows().catch(() => [])
+      console.warn(`[organizer] startup collection deferred until all ${expectedVisibleWidgets.length} component surfaces are visible`)
+      scheduleOrganizerStorageReconcileRetry(attempt + 1)
+      return
+    }
+    let failed = false
+    await enqueueWorkspaceMutation(() => reconcileOrganizerStorage())
+      .catch((error) => {
+        failed = true
+        console.warn(`[organizer] startup reconcile retry failed: ${error.message}`)
       })
+    if (failed || hasPendingOrganizerStorageReconcile()) {
+      scheduleOrganizerStorageReconcileRetry(attempt + 1)
+    }
   }, delays[attempt])
+}
+
+const recoverWorkspaceMetadataFromSnapshots = async (workspace) => {
+  if (!workspace?.widgets?.length) return 0
+  const currentFiles = new Map(workspace.widgets
+    .filter((widget) => widget.kind === 'organizer')
+    .flatMap((widget) => (Array.isArray(widget.data?.files) ? widget.data.files : [])
+      .filter((file) => typeof file?.id === 'string' && file.id)
+      .map((file) => [file.id, { widgetId: widget.id, file }])))
+  if (!currentFiles.size) return 0
+
+  let entries = []
+  try {
+    entries = (await fs.promises.readdir(path.join(app.getPath('userData'), 'workspace-snapshots'), {
+      withFileTypes: true,
+    }))
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json') && !entry.name.endsWith('.tmp.json'))
+      .sort((left, right) => right.name.localeCompare(left.name))
+  } catch {
+    return 0
+  }
+
+  const profileBySignature = new Map((Array.isArray(workspace.desktopIconLayoutProfiles)
+    ? workspace.desktopIconLayoutProfiles
+    : []).map((profile) => [workspaceLayoutSignature(profile.desktopLayout), {
+      ...profile,
+      signature: workspaceLayoutSignature(profile.desktopLayout),
+      positions: Array.isArray(profile.positions) ? [...profile.positions] : [],
+    }]))
+  const profileKeys = new Map([...profileBySignature].map(([signature, profile]) => [
+    signature,
+    new Set(profile.positions.map((position) => `${position.widgetId}:${position.fileId}`)),
+  ]))
+  const metadataFields = [
+    'originalPath',
+    'originalDesktopPosition',
+    'iconDataUrl',
+    'shellClsid',
+    'shellVisibilityValueExists',
+    'shellVisibilityValue',
+    'shellVisibilityStates',
+  ]
+  let recovered = 0
+
+  for (const entry of entries.slice(0, 30)) {
+    let document
+    try {
+      document = JSON.parse(await fs.promises.readFile(
+        path.join(app.getPath('userData'), 'workspace-snapshots', entry.name),
+        'utf8',
+      ))
+    } catch {
+      continue
+    }
+    const snapshotLayout = document?.desktop?.displays?.length
+      ? document.desktop
+      : document?.workspace?.desktopLayout
+    const signature = snapshotLayout?.displays?.length
+      ? workspaceLayoutSignature(snapshotLayout)
+      : ''
+    let iconProfile = signature ? profileBySignature.get(signature) : null
+    if (signature && !iconProfile) {
+      iconProfile = {
+        signature,
+        desktopLayout: snapshotLayout,
+        positions: [],
+        updatedAt: document.createdAt || new Date().toISOString(),
+      }
+      profileBySignature.set(signature, iconProfile)
+      profileKeys.set(signature, new Set())
+      recovered += 1
+    }
+    for (const widget of Array.isArray(document?.workspace?.widgets) ? document.workspace.widgets : []) {
+      if (widget.kind !== 'organizer') continue
+      for (const snapshotFile of Array.isArray(widget.data?.files) ? widget.data.files : []) {
+        const current = currentFiles.get(snapshotFile?.id)
+        if (!current) continue
+        for (const field of metadataFields) {
+          if (current.file[field] != null || snapshotFile[field] == null) continue
+          current.file[field] = JSON.parse(JSON.stringify(snapshotFile[field]))
+          recovered += 1
+        }
+        if (!iconProfile || !snapshotFile.originalDesktopPosition) continue
+        const key = `${current.widgetId}:${snapshotFile.id}`
+        const keys = profileKeys.get(signature)
+        if (keys.has(key)) continue
+        keys.add(key)
+        iconProfile.positions.push({
+          widgetId: current.widgetId,
+          fileId: snapshotFile.id,
+          x: snapshotFile.originalDesktopPosition.x,
+          y: snapshotFile.originalDesktopPosition.y,
+        })
+        recovered += 1
+      }
+    }
+  }
+
+  workspace.desktopIconLayoutProfiles = [...profileBySignature.values()]
+    .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')))
+    .slice(0, 12)
+  return recovered
+}
+
+const normalizeLoadedWorkspace = (parsed) => {
+  const normalizedLayoutProfiles = []
+  const seenLayoutSignatures = new Set()
+  for (const profile of Array.isArray(parsed?.desktopLayoutProfiles) ? parsed.desktopLayoutProfiles : []) {
+    if (!profile?.desktopLayout?.displays?.length) continue
+    const signature = workspaceLayoutSignature(profile.desktopLayout)
+    if (seenLayoutSignatures.has(signature)) continue
+    seenLayoutSignatures.add(signature)
+    normalizedLayoutProfiles.push({ ...profile, signature })
+  }
+  const normalizedIconProfiles = []
+  const seenIconSignatures = new Set()
+  for (const profile of Array.isArray(parsed?.desktopIconLayoutProfiles) ? parsed.desktopIconLayoutProfiles : []) {
+    if (!profile?.desktopLayout?.displays?.length || !Array.isArray(profile.positions)) continue
+    const signature = workspaceLayoutSignature(profile.desktopLayout)
+    if (seenIconSignatures.has(signature)) continue
+    seenIconSignatures.add(signature)
+    normalizedIconProfiles.push({ ...profile, signature })
+  }
+  return {
+    ...defaultWorkspace(),
+    ...(parsed || {}),
+    version: 1,
+    widgets: Array.isArray(parsed?.widgets) ? parsed.widgets : [],
+    desktopLayout: parsed?.desktopLayout && Array.isArray(parsed.desktopLayout.displays)
+      ? parsed.desktopLayout
+      : null,
+    desktopLayoutProfiles: normalizedLayoutProfiles.slice(0, 12),
+    desktopIconLayoutProfiles: normalizedIconProfiles.slice(0, 12),
+    settings: { ...defaultWorkspace().settings, ...(parsed?.settings || {}) },
+  }
+}
+
+const latestSafetySnapshotWorkspace = async () => {
+  let entries = []
+  try {
+    entries = (await fs.promises.readdir(path.join(app.getPath('userData'), 'workspace-snapshots'), {
+      withFileTypes: true,
+    }))
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json') && !entry.name.endsWith('.tmp.json'))
+      .sort((left, right) => right.name.localeCompare(left.name))
+  } catch {
+    return null
+  }
+  for (const entry of entries) {
+    try {
+      const document = JSON.parse(await fs.promises.readFile(
+        path.join(app.getPath('userData'), 'workspace-snapshots', entry.name),
+        'utf8',
+      ))
+      if (document?.workspace && Array.isArray(document.workspace.widgets)) return document.workspace
+    } catch {}
+  }
+  return null
 }
 
 const loadWorkspace = async () => {
   workspacePath = path.join(app.getPath('userData'), 'desktop-workspace.json')
   try {
     const parsed = JSON.parse(await fs.promises.readFile(workspacePath, 'utf8'))
-    workspaceState = {
-      ...defaultWorkspace(),
-      ...parsed,
-      version: 1,
-      widgets: Array.isArray(parsed.widgets) ? parsed.widgets : [],
-      desktopLayout: parsed.desktopLayout && Array.isArray(parsed.desktopLayout.displays)
-        ? parsed.desktopLayout
-        : null,
-      desktopLayoutProfiles: Array.isArray(parsed.desktopLayoutProfiles)
-        ? parsed.desktopLayoutProfiles.slice(0, 12)
-        : [],
-      settings: { ...defaultWorkspace().settings, ...(parsed.settings || {}) },
+    workspaceState = normalizeLoadedWorkspace(parsed)
+  } catch (error) {
+    const recoveredWorkspace = await latestSafetySnapshotWorkspace()
+    workspaceState = normalizeLoadedWorkspace(recoveredWorkspace || defaultWorkspace())
+    if (recoveredWorkspace) {
+      console.warn(`[workspace] primary workspace unavailable; recovered latest safety snapshot: ${error.message}`)
+      await persistWorkspace()
     }
-  } catch {
-    workspaceState = defaultWorkspace()
+  }
+
+  if (!capturePath && !desktopHostTest && !desktopTrayTest) {
+    const recoveredMetadata = await recoverWorkspaceMetadataFromSnapshots(workspaceState)
+    if (recoveredMetadata) {
+      console.warn(`[workspace] recovered ${recoveredMetadata} organizer metadata/profile value(s) from safety snapshots`)
+      await persistWorkspace()
+    }
   }
 
   if (capturePath || desktopHostTestDemo) {
@@ -2022,6 +2246,67 @@ const captureSnapshotDesktop = () => {
       primary: display.id === primaryId,
     })),
   }
+}
+
+const storeDesktopIconLayoutProfile = (profile) => {
+  if (!workspaceState || !profile?.desktopLayout?.displays?.length || !Array.isArray(profile.positions)) return false
+  const signature = workspaceLayoutSignature(profile.desktopLayout)
+  const profiles = Array.isArray(workspaceState.desktopIconLayoutProfiles)
+    ? workspaceState.desktopIconLayoutProfiles
+    : []
+  const normalized = {
+    ...profile,
+    signature,
+    updatedAt: new Date().toISOString(),
+  }
+  const previous = profiles.find((candidate) => (
+    workspaceLayoutSignature(candidate?.desktopLayout) === signature
+  ))
+  if (previous && JSON.stringify(previous.positions) === JSON.stringify(normalized.positions)) return false
+  workspaceState.desktopIconLayoutProfiles = [
+    normalized,
+    ...profiles.filter((candidate) => workspaceLayoutSignature(candidate?.desktopLayout) !== signature),
+  ].slice(0, 12)
+  return true
+}
+
+const captureCurrentDesktopIconLayoutProfile = async () => {
+  if (!workspaceState?.widgets) return false
+  await refreshDesktopIconPositions(true)
+  const positions = []
+  for (const widget of workspaceState.widgets.filter((candidate) => candidate.kind === 'organizer')) {
+    for (const file of Array.isArray(widget.data?.files) ? widget.data.files : []) {
+      let position = null
+      if (isOrganizerShellItem(file)) {
+        position = desktopIconPositionForShellItem(file, desktopShellItemDefinitionForClsid(file.shellClsid))
+      } else if (
+        file.temporarilyRestoredOnExit === true
+        && typeof file.path === 'string'
+        && fs.existsSync(file.path)
+        && pathIsDesktopItem(file.path)
+      ) {
+        position = desktopIconPositionForPath(file.path, Boolean(file.isDirectory))
+      }
+      if (!position) continue
+      positions.push({ widgetId: widget.id, fileId: file.id, x: position.x, y: position.y })
+    }
+  }
+  if (!positions.length) return false
+  return storeDesktopIconLayoutProfile({
+    desktopLayout: captureSnapshotDesktop(),
+    positions,
+  })
+}
+
+const currentDesktopIconPositionMap = () => {
+  const signature = workspaceLayoutSignature(captureSnapshotDesktop())
+  const profile = (Array.isArray(workspaceState?.desktopIconLayoutProfiles)
+    ? workspaceState.desktopIconLayoutProfiles
+    : []).find((candidate) => workspaceLayoutSignature(candidate?.desktopLayout) === signature)
+  return new Map((Array.isArray(profile?.positions) ? profile.positions : []).map((position) => [
+    `${position.widgetId}:${position.fileId}`,
+    { x: position.x, y: position.y },
+  ]))
 }
 
 const storeDesktopLayoutProfile = (profile) => {
@@ -3550,6 +3835,7 @@ const setDesktopEnabled = async (enabled) => {
   } else {
     if (!windows.length) return result
     await attachDesktopWindows()
+    scheduleOrganizerStorageReconcileRetry()
   }
   return result
 }
@@ -7119,8 +7405,6 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
     refreshDesktopIconPositions().catch(() => {})
   }
   if (!capturePath && !desktopHostTest && !desktopTrayTest) {
-    await reconcileOrganizerStorage()
-    scheduleOrganizerStorageReconcileRetry()
     startRestoreGuardian()
   }
   if (constrainWorkspaceWidgetFrames()) await persistWorkspace()
@@ -8118,11 +8402,38 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
   } else {
     createDesktopWidgetWindows()
     createControlWindow()
+    scheduleOrganizerStorageReconcileRetry()
   }
 
   app.on('activate', () => {
     if (!controlWindow && !capturePath) createControlWindow()
   })
+}).catch(async (error) => {
+  const message = error?.stack || error?.message || String(error)
+  console.error(`[startup] initialization failed: ${message}`)
+  try {
+    await fs.promises.mkdir(app.getPath('userData'), { recursive: true })
+    await fs.promises.appendFile(
+      path.join(app.getPath('userData'), 'startup-errors.log'),
+      `${new Date().toISOString()} ${message}\n`,
+      'utf8',
+    )
+  } catch {}
+  // Never leave the single-instance process alive without IPC, tray or a
+  // visible explanation. In particular, a storage/Explorer failure must not
+  // produce the misleading state where a second EXE launch opens an empty
+  // control center while the first initialization promise has already died.
+  try {
+    if (!workspaceState) workspaceState = defaultWorkspace()
+    desktopHostState = 'fallback'
+    desktopStatusMessage = `启动未完成：${error?.message || String(error)}`
+    if (!ipcHandlersRegistered) registerIpc()
+    if (!capturePath && !desktopHostTest && !desktopTrayTest) ensureTray()
+    showControlCenter()
+    broadcastDesktopStatus()
+  } catch (recoveryError) {
+    console.error(`[startup] recovery UI failed: ${recoveryError.message}`)
+  }
 })
 
 app.on('before-quit', (event) => {

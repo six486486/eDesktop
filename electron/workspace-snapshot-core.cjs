@@ -22,12 +22,22 @@ const workspaceLayoutSignature = (layout) => JSON.stringify(
   (Array.isArray(layout) ? layout : (Array.isArray(layout?.displays) ? layout.displays : []))
     .map(normalizeDisplay)
     .map((display) => ({
-      id: display.id,
+      // Electron display ids are session-local on Windows and can change after
+      // a reboot or dock cycle. A topology profile describes geometry and DPI,
+      // not one boot's transient display handle.
+      label: display.label.trim().toLocaleLowerCase(),
       primary: display.primary,
       scaleFactor: display.scaleFactor,
       bounds: display.bounds,
     }))
-    .sort((left, right) => left.id.localeCompare(right.id)),
+    .sort((left, right) => (
+      left.bounds.x - right.bounds.x
+      || left.bounds.y - right.bounds.y
+      || left.bounds.width - right.bounds.width
+      || left.bounds.height - right.bounds.height
+      || left.scaleFactor - right.scaleFactor
+      || left.label.localeCompare(right.label)
+    )),
 )
 
 const captureWorkspaceLayoutProfile = (workspace, desktopLayout) => ({
