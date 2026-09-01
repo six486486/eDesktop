@@ -1,4 +1,6 @@
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
 const {
   desktopShellVisibilityEquals,
   hiddenDesktopShellVisibility,
@@ -35,4 +37,17 @@ assert.equal(desktopShellVisibilityEquals(
   { newStartPanel: { exists: true, value: 1 }, classicStartMenu: { exists: false, value: 0 } },
 ), false)
 
-console.log('[desktop-shell-visibility] dual registry state + legacy migration assertions passed')
+const electronRoot = path.join(__dirname, '..', 'electron')
+const mainSource = fs.readFileSync(path.join(electronRoot, 'main.cjs'), 'utf8')
+const guardianSource = fs.readFileSync(path.join(electronRoot, 'restore-guardian.cjs'), 'utf8')
+const helperSource = fs.readFileSync(path.join(electronRoot, 'windows-desktop-icons.ps1'), 'utf8')
+assert.equal(mainSource.includes('desktop-shell-restart'), false)
+assert.equal(guardianSource.includes('desktop-shell-restart'), false)
+assert.equal(helperSource.includes('RestartDesktopShell'), false)
+assert.match(helperSource, /SetWinEventHook/)
+assert.match(helperSource, /guard-items/)
+assert.match(mainSource, /configureDesktopShellItemGuard/)
+assert.match(mainSource, /if \(ipcHandlersRegistered\) syncDesktopWidgetWindows\(\)/)
+assert.match(mainSource, /ipcHandlersRegistered = true/)
+
+console.log('[desktop-shell-visibility] state migration + event guard + startup sequencing + no Explorer restart assertions passed')

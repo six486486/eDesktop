@@ -16,7 +16,6 @@ Add-Type -AssemblyName System.Drawing
 $source = @'
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -115,6 +114,28 @@ public static class DesktopIconNative
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public UIntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public POINT point;
+        public uint privateData;
+    }
+
+    private delegate void WinEventDelegate(
+        IntPtr hook,
+        uint eventType,
+        IntPtr hwnd,
+        int objectId,
+        int childId,
+        uint eventThread,
+        uint eventTime
+    );
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct SHFILEINFO
     {
@@ -144,6 +165,29 @@ public static class DesktopIconNative
 
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWinEventHook(
+        uint eventMin,
+        uint eventMax,
+        IntPtr module,
+        WinEventDelegate callback,
+        uint processId,
+        uint threadId,
+        uint flags
+    );
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWinEvent(IntPtr hook);
+
+    [DllImport("user32.dll")]
+    private static extern int GetMessage(out MSG message, IntPtr hwnd, uint messageMin, uint messageMax);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostThreadMessage(uint threadId, uint message, UIntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr SendMessageTimeout(
@@ -260,9 +304,6 @@ public static class DesktopIconNative
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern void SHChangeNotify(uint eventId, uint flags, string item1, string item2);
 
-    [DllImport("shell32.dll", EntryPoint = "SHChangeNotify")]
-    private static extern void SHChangeNotifyPointer(uint eventId, uint flags, IntPtr item1, IntPtr item2);
-
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr SHGetFileInfo(
         string path,
@@ -305,6 +346,7 @@ public static class DesktopIconNative
 
     private const uint LVM_FIRST = 0x1000;
     private const uint LVM_GETITEMCOUNT = LVM_FIRST + 4;
+    private const uint LVM_DELETEITEM = LVM_FIRST + 8;
     private const uint LVM_GETITEMPOSITION = LVM_FIRST + 16;
     private const uint LVM_GETITEMSTATE = LVM_FIRST + 44;
     private const uint LVM_GETITEMTEXTW = LVM_FIRST + 115;
@@ -318,15 +360,18 @@ public static class DesktopIconNative
     private const uint SHCNE_UPDATEDIR = 0x00001000;
     private const uint SHCNE_RENAMEFOLDER = 0x00020000;
     private const uint SHCNF_PATHW = 0x0005;
-    private const uint SHCNF_IDLIST = 0x0000;
     private const uint SHCNF_FLUSH = 0x1000;
-    private const uint SHCNE_ASSOCCHANGED = 0x08000000;
     private const uint WM_COMMAND = 0x0111;
     private const int FCIDM_SHVIEW_REFRESH = 0x7103;
     private const uint SHGFI_ICON = 0x00000100;
     private const uint SHGFI_PIDL = 0x00000008;
     private const uint SHGFI_LARGEICON = 0x00000000;
     private const uint LVIS_SELECTED = 0x0002;
+    private const uint EVENT_OBJECT_CREATE = 0x8000;
+    private const uint EVENT_OBJECT_NAMECHANGE = 0x800C;
+    private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+    private const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+    private const uint WM_QUIT = 0x0012;
     private const uint SMTO_BLOCK = 0x0001;
     private const uint SMTO_ABORTIFHUNG = 0x0002;
     private const uint SMTO_ERRORONEXIT = 0x0020;
@@ -351,6 +396,14 @@ public static class DesktopIconNative
     private const uint RDW_ALLCHILDREN = 0x0080;
     private static readonly IntPtr HWND_TOP = IntPtr.Zero;
     private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
+    private static readonly object DesktopViewMutationLock = new object();
+    private static readonly object DesktopItemGuardLock = new object();
+    private static HashSet<string> desktopItemGuardNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private static Thread desktopItemGuardThread;
+    private static uint desktopItemGuardThreadId;
+    private static IntPtr desktopItemGuardHook = IntPtr.Zero;
+    private static WinEventDelegate desktopItemGuardCallback;
+    private static int desktopItemGuardRefreshPending;
 
     private static IntPtr SendDesktopMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam)
     {
@@ -396,6 +449,104 @@ public static class DesktopIconNative
         return defView == IntPtr.Zero
             ? IntPtr.Zero
             : FindWindowEx(defView, IntPtr.Zero, "SysListView32", "FolderView");
+    }
+
+    private static bool IsDesktopItemGuardEvent(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        IntPtr listView = FindListView();
+        if (listView != IntPtr.Zero && hwnd == listView) return true;
+        IntPtr defView = FindDesktopDefView();
+        return defView != IntPtr.Zero && hwnd == defView;
+    }
+
+    private static string[] DesktopItemGuardNamesSnapshot()
+    {
+        lock (DesktopItemGuardLock)
+        {
+            var names = new string[desktopItemGuardNames.Count];
+            desktopItemGuardNames.CopyTo(names);
+            return names;
+        }
+    }
+
+    private static void QueueDesktopItemGuardRefresh()
+    {
+        if (Interlocked.Exchange(ref desktopItemGuardRefreshPending, 1) != 0) return;
+        ThreadPool.QueueUserWorkItem(unused =>
+        {
+            try
+            {
+                Thread.Sleep(32);
+                string[] names = DesktopItemGuardNamesSnapshot();
+                if (names.Length > 0) HideItems(names);
+            }
+            catch
+            {
+            }
+            finally
+            {
+                Interlocked.Exchange(ref desktopItemGuardRefreshPending, 0);
+            }
+        });
+    }
+
+    private static void DesktopItemGuardThreadMain(ManualResetEventSlim ready)
+    {
+        desktopItemGuardThreadId = GetCurrentThreadId();
+        desktopItemGuardCallback = (hook, eventType, hwnd, objectId, childId, eventThread, eventTime) =>
+        {
+            if (IsDesktopItemGuardEvent(hwnd)) QueueDesktopItemGuardRefresh();
+        };
+        desktopItemGuardHook = SetWinEventHook(
+            EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_NAMECHANGE,
+            IntPtr.Zero,
+            desktopItemGuardCallback,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+        );
+        ready.Set();
+        if (desktopItemGuardHook == IntPtr.Zero) return;
+        MSG message;
+        while (GetMessage(out message, IntPtr.Zero, 0, 0) > 0)
+        {
+        }
+        UnhookWinEvent(desktopItemGuardHook);
+        desktopItemGuardHook = IntPtr.Zero;
+        desktopItemGuardThreadId = 0;
+        desktopItemGuardCallback = null;
+    }
+
+    public static bool ConfigureDesktopItemGuard(string[] names)
+    {
+        lock (DesktopItemGuardLock)
+        {
+            desktopItemGuardNames = new HashSet<string>(names ?? new string[0], StringComparer.OrdinalIgnoreCase);
+        }
+        string[] requestedNames = DesktopItemGuardNamesSnapshot();
+        if (requestedNames.Length == 0)
+        {
+            uint threadId = desktopItemGuardThreadId;
+            if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, UIntPtr.Zero, IntPtr.Zero);
+            Thread guardThread = desktopItemGuardThread;
+            if (guardThread != null && guardThread.IsAlive) guardThread.Join(500);
+            desktopItemGuardThread = null;
+            return true;
+        }
+        if (desktopItemGuardThread == null || !desktopItemGuardThread.IsAlive)
+        {
+            var ready = new ManualResetEventSlim(false);
+            desktopItemGuardThread = new Thread(() => DesktopItemGuardThreadMain(ready));
+            desktopItemGuardThread.IsBackground = true;
+            desktopItemGuardThread.Name = "eDesktop system icon guard";
+            desktopItemGuardThread.Start();
+            if (!ready.Wait(1000) || desktopItemGuardHook == IntPtr.Zero) return false;
+        }
+        HideItems(requestedNames);
+        QueueDesktopItemGuardRefresh();
+        return true;
     }
 
     private static IntPtr FindDesktopIconHost()
@@ -981,6 +1132,34 @@ public static class DesktopIconNative
         });
     }
 
+    public static DesktopIconInfo[] HideItems(string[] names)
+    {
+        if (names == null || names.Length == 0) return new DesktopIconInfo[0];
+        var requestedNames = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+        lock (DesktopViewMutationLock)
+        {
+            return WithDesktopProcess((listView, process, remoteItem, remoteText, remotePoint) =>
+            {
+                List<DesktopIconInfo> items = ReadItems(listView, process, remoteItem, remoteText, remotePoint);
+                var hidden = new List<DesktopIconInfo>();
+                for (int index = items.Count - 1; index >= 0; index--)
+                {
+                    DesktopIconInfo item = items[index];
+                    if (!requestedNames.Contains(item.Name)) continue;
+                    if (SendDesktopMessage(listView, LVM_DELETEITEM, (IntPtr)index, IntPtr.Zero) == IntPtr.Zero) continue;
+                    hidden.Add(item);
+                }
+                hidden.Reverse();
+                return hidden;
+            });
+        }
+    }
+
+    public static bool HasDesktopView()
+    {
+        return FindListView() != IntPtr.Zero;
+    }
+
     public static DesktopIconInfo[] GetSelectedItems()
     {
         return WithDesktopProcess((listView, process, remoteItem, remoteText, remotePoint) =>
@@ -1064,68 +1243,12 @@ public static class DesktopIconNative
         }
     }
 
-    public static bool RefreshShellIcons()
+    public static bool RefreshDesktopView()
     {
-        SHChangeNotifyPointer(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, IntPtr.Zero, IntPtr.Zero);
         IntPtr defView = FindDesktopDefView();
-        if (defView != IntPtr.Zero)
-            SendDesktopMessage(defView, WM_COMMAND, new IntPtr(FCIDM_SHVIEW_REFRESH), IntPtr.Zero);
+        if (defView == IntPtr.Zero) return false;
+        SendDesktopMessage(defView, WM_COMMAND, new IntPtr(FCIDM_SHVIEW_REFRESH), IntPtr.Zero);
         return true;
-    }
-
-    public static int GetDesktopShellProcessId()
-    {
-        IntPtr shellWindow = FindWindow("Shell_TrayWnd", null);
-        if (shellWindow == IntPtr.Zero) return 0;
-        uint processId;
-        GetWindowThreadProcessId(shellWindow, out processId);
-        return unchecked((int)processId);
-    }
-
-    public static bool RestartDesktopShell()
-    {
-        int previousProcessId = GetDesktopShellProcessId();
-        if (previousProcessId <= 0) return false;
-        try
-        {
-            Process shellProcess = Process.GetProcessById(previousProcessId);
-            shellProcess.Kill();
-            shellProcess.WaitForExit(5000);
-            shellProcess.Dispose();
-        }
-        catch
-        {
-            return false;
-        }
-
-        // AutoRestartShell normally creates the replacement. Start Explorer
-        // ourselves only if Windows has not done so, avoiding an extra folder
-        // window when the automatic restart was already successful.
-        for (int attempt = 0; attempt < 30; attempt++)
-        {
-            Thread.Sleep(100);
-            int currentProcessId = GetDesktopShellProcessId();
-            if (currentProcessId > 0 && currentProcessId != previousProcessId) break;
-            if (attempt == 14)
-            {
-                string explorerPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                    "explorer.exe"
-                );
-                Process.Start(explorerPath);
-            }
-        }
-
-        for (int attempt = 0; attempt < 50; attempt++)
-        {
-            if (FindListView() != IntPtr.Zero)
-            {
-                RefreshShellIcons();
-                return true;
-            }
-            Thread.Sleep(100);
-        }
-        return false;
     }
 
     public static bool SetItemPosition(string name, int x, int y)
@@ -1369,7 +1492,6 @@ function Set-DesktopShellItemVisibility([string]$Clsid, [bool]$Exists, [int]$Val
       $key.Dispose()
     }
   }
-  [DesktopIconNative]::RefreshShellIcons() | Out-Null
   return $true
 }
 
@@ -1381,6 +1503,19 @@ if ($Mode -eq 'server') {
       $request = $line | ConvertFrom-Json
       if ($request.command -eq 'list') {
         $result = @([DesktopIconNative]::GetItems())
+      } elseif ($request.command -eq 'hide-items') {
+        $names = @($request.names | ForEach-Object { [string]$_ })
+        $hiddenItems = @([DesktopIconNative]::HideItems($names))
+        $result = @{
+          viewAvailable = [DesktopIconNative]::HasDesktopView()
+          hidden = $hiddenItems
+        }
+      } elseif ($request.command -eq 'guard-items') {
+        $result = [DesktopIconNative]::ConfigureDesktopItemGuard(
+          @($request.names | ForEach-Object { [string]$_ })
+        )
+      } elseif ($request.command -eq 'desktop-view-refresh') {
+        $result = [DesktopIconNative]::RefreshDesktopView()
       } elseif ($request.command -eq 'selected') {
         $result = @([DesktopIconNative]::GetSelectedItems())
       } elseif ($request.command -eq 'icon-data') {
@@ -1393,8 +1528,6 @@ if ($Mode -eq 'server') {
         $result = Get-DesktopShellItemVisibility ([string]$request.clsid)
       } elseif ($request.command -eq 'shell-item-visibility-set') {
         $result = Set-DesktopShellItemVisibility ([string]$request.clsid) ([bool]$request.exists) ([int]$request.value) $request.states
-      } elseif ($request.command -eq 'desktop-shell-restart') {
-        $result = [DesktopIconNative]::RestartDesktopShell()
       } elseif ($request.command -eq 'set') {
         $result = [DesktopIconNative]::SetItemPosition([string]$request.name, [int]$request.x, [int]$request.y)
       } elseif ($request.command -eq 'set-many') {

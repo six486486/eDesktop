@@ -141,6 +141,7 @@ const desktopWidgetGeometryMismatchCounts = new Map()
 const desktopWidgetGeometryRecoveryTokens = new Map()
 let desktopIconHelperProcess = null
 let desktopIconHelperRequestId = 0
+let desktopShellItemGuardNames = []
 let desktopIconPositionRefresh = null
 let desktopIconPositionCacheUpdatedAt = 0
 const desktopIconHelperPending = new Map()
@@ -158,7 +159,7 @@ let activeOrganizerFileSelection = null
 let organizerFileSelectionRevision = 0
 let activeOrganizerContextMenu = null
 let organizerContextMenuSequence = 0
-let desktopShellRestartInFlight = null
+let ipcHandlersRegistered = false
 
 const useDesktopWidgetWindows = !capturePath && (
   !desktopHostTest
@@ -570,6 +571,15 @@ const startDesktopIconHelper = () => {
   child.once('error', close)
   child.once('exit', () => close(new Error('桌面图标辅助程序已退出')))
   desktopIconHelperProcess = child
+  if (desktopShellItemGuardNames.length) {
+    child.stdin.write(`${JSON.stringify({
+      id: 0,
+      command: 'guard-items',
+      names: desktopShellItemGuardNames,
+    })}\n`, (error) => {
+      if (error) retireDesktopIconHelper(child, error, true)
+    })
+  }
   return child
 }
 
@@ -641,31 +651,81 @@ const setDesktopShellItemVisibility = async (clsid, visibility) => {
   throw lastError || new Error('系统桌面项可见性更新未生效')
 }
 
-const reattachDesktopWindowsAfterShellRestart = async () => {
-  const windows = liveDesktopWindows()
-  if (!windows.length || !workspaceState?.settings.desktopEnabled) return
-  for (const win of windows) {
-    if (win.isDestroyed()) continue
-    win.desktopAttached = false
-    if (isOrganizerWidgetWindow(win)) win.desktopOrganizerChildAttached = false
+const refreshDesktopView = async () => {
+  let lastError = null
+  for (const delayMs of [0, 80, 240]) {
+    if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs))
+    try {
+      const refreshed = await desktopIconHelperRequest('desktop-view-refresh', {}, 1_500)
+      if (refreshed) return true
+      lastError = new Error('Windows 桌面视图尚未就绪')
+    } catch (error) {
+      lastError = error
+    }
   }
-  await attachDesktopWindows()
-  scheduleAllDesktopWidgetGeometryReconcile('explorer-shell-restarted', [120, 420, 1_000])
+  throw lastError || new Error('Windows 桌面视图刷新失败')
 }
 
-const restartDesktopShell = async ({ reattachDesktopWindows = true } = {}) => {
-  if (desktopShellRestartInFlight) return desktopShellRestartInFlight
-  desktopShellRestartInFlight = (async () => {
-    const restarted = await desktopIconHelperRequest('desktop-shell-restart', {}, 12_000)
-    if (!restarted) throw new Error('Windows 桌面进程重新加载失败')
-    desktopIconPositionCache.clear()
-    desktopIconPositionCacheUpdatedAt = 0
-    if (reattachDesktopWindows) await reattachDesktopWindowsAfterShellRestart()
-    return true
-  })().finally(() => {
-    desktopShellRestartInFlight = null
-  })
-  return desktopShellRestartInFlight
+const desktopShellHideDescriptors = (entries) => {
+  const descriptors = new Map()
+  for (const entry of entries || []) {
+    const definition = entry?.definition || entry
+    if (!definition?.clsid) continue
+    const key = definition.clsid.toLocaleLowerCase()
+    const existing = descriptors.get(key) || { definition, names: new Set() }
+    for (const name of [entry?.name, ...(entry?.names || []), ...(definition.aliases || [])]) {
+      if (typeof name === 'string' && name) existing.names.add(name)
+    }
+    descriptors.set(key, existing)
+  }
+  return [...descriptors.values()]
+}
+
+const configureDesktopShellItemGuard = async (names) => {
+  const normalized = [...new Set((names || [])
+    .filter((name) => typeof name === 'string' && name)
+    .map((name) => name.trim())
+    .filter(Boolean))]
+  desktopShellItemGuardNames = normalized
+  const configured = await desktopIconHelperRequest('guard-items', { names: normalized }, 2_000)
+  if (!configured) throw new Error('系统桌面图标监听器启动失败')
+  return normalized
+}
+
+const suspendDesktopShellItemGuardFor = async (entries) => {
+  const removalNames = new Set(desktopShellHideDescriptors(entries)
+    .flatMap((descriptor) => [...descriptor.names])
+    .map((name) => name.toLocaleLowerCase()))
+  const previousNames = [...desktopShellItemGuardNames]
+  await configureDesktopShellItemGuard(previousNames.filter((name) => (
+    !removalNames.has(name.toLocaleLowerCase())
+  )))
+  return previousNames
+}
+
+const hideDesktopShellItemsFromView = async (descriptors) => {
+  const names = [...new Set(descriptors.flatMap((descriptor) => [...descriptor.names]))]
+  if (!names.length) return { hidden: [] }
+  const normalizedNames = new Set(names.map((name) => name.toLocaleLowerCase()))
+  let lastError = null
+  for (const delayMs of [0, 80, 240, 700]) {
+    if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs))
+    try {
+      const result = await desktopIconHelperRequest('hide-items', { names }, 2_000)
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      const currentItems = await desktopIconHelperRequest('list', {}, 2_000)
+      const remaining = (Array.isArray(currentItems) ? currentItems : []).filter((item) => (
+        normalizedNames.has(String(item?.Name || '').toLocaleLowerCase())
+      ))
+      if (result?.viewAvailable && !remaining.length) return result
+      lastError = new Error(result?.viewAvailable
+        ? 'Windows 桌面仍保留系统图标'
+        : 'Windows 桌面视图尚未就绪')
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError || new Error('系统桌面图标实时隐藏失败')
 }
 
 const verifyDesktopShellVisibilityStates = async (restorations) => {
@@ -680,37 +740,44 @@ const verifyDesktopShellVisibilityStates = async (restorations) => {
 
 const ensureDesktopShellItemsRestored = async (
   restorations,
-  { reattachDesktopWindows = true, requiresShellRestart = false } = {},
+  { requiresDesktopRefresh = false } = {},
 ) => {
   const verifiable = (restorations || []).filter(({ definition }) => definition)
-  if (!verifiable.length) return { restored: true, restarted: false }
-  if (requiresShellRestart) {
-    await restartDesktopShell({ reattachDesktopWindows })
-    await new Promise((resolve) => setTimeout(resolve, 900))
+  if (!verifiable.length) return { restored: true, refreshed: false }
+  if (requiresDesktopRefresh) {
+    await refreshDesktopView()
+    await new Promise((resolve) => setTimeout(resolve, 160))
   }
   await verifyDesktopShellVisibilityStates(verifiable)
-  return { restored: true, restarted: requiresShellRestart }
+  return { restored: true, refreshed: requiresDesktopRefresh }
 }
 
-const ensureDesktopShellItemsHidden = async (definitions, { allowShellRestart = true } = {}) => {
-  const uniqueDefinitions = [...new Map((definitions || [])
-    .filter(Boolean)
-    .map((definition) => [definition.clsid.toLocaleLowerCase(), definition])).values()]
-  if (!uniqueDefinitions.length) return { hidden: true, restarted: false }
-  const updates = await Promise.all(uniqueDefinitions.map((definition) => (
+const ensureDesktopShellItemsHidden = async (entries) => {
+  const descriptors = desktopShellHideDescriptors(entries)
+  if (!descriptors.length) return { hidden: true, updated: false, removed: 0 }
+  const previousGuardNames = [...desktopShellItemGuardNames]
+  const updates = await Promise.all(descriptors.map(({ definition }) => (
     setDesktopShellItemVisibility(definition.clsid, hiddenDesktopShellVisibility())
   )))
-  const requiresShellRestart = updates.some((update) => update?.changed)
-  if (requiresShellRestart && !allowShellRestart) return { hidden: false, restarted: false }
-  if (requiresShellRestart) {
-    await restartDesktopShell()
-    await new Promise((resolve) => setTimeout(resolve, 900))
+  try {
+    await configureDesktopShellItemGuard([
+      ...previousGuardNames,
+      ...descriptors.flatMap((descriptor) => [...descriptor.names]),
+    ])
+    const liveResult = await hideDesktopShellItemsFromView(descriptors)
+    await verifyDesktopShellVisibilityStates(descriptors.map(({ definition }) => ({
+      definition,
+      visibility: hiddenDesktopShellVisibility(),
+    })))
+    return {
+      hidden: true,
+      updated: updates.some((update) => update?.changed),
+      removed: Array.isArray(liveResult?.hidden) ? liveResult.hidden.length : 0,
+    }
+  } catch (error) {
+    await configureDesktopShellItemGuard(previousGuardNames).catch(() => {})
+    throw error
   }
-  await verifyDesktopShellVisibilityStates(uniqueDefinitions.map((definition) => ({
-    definition,
-    visibility: hiddenDesktopShellVisibility(),
-  })))
-  return { hidden: true, restarted: requiresShellRestart }
 }
 
 const captureSelectedDesktopShellItems = async () => {
@@ -1192,7 +1259,7 @@ const importOrganizerShellItems = async (widgetId, selectedItems) => {
         : definition.aliases[0]
       const shellPath = desktopShellItemPath(definition.clsid)
       const position = selection.position || desktopIconPositionCache.get(displayName.toLocaleLowerCase()) || null
-      hiddenItems.push({ definition, visibility: visibilityStates })
+      hiddenItems.push({ definition, visibility: visibilityStates, name: displayName })
       importedFiles.push({
         id: Buffer.from(shellPath.toLocaleLowerCase()).toString('base64url'),
         path: shellPath,
@@ -1217,14 +1284,15 @@ const importOrganizerShellItems = async (widgetId, selectedItems) => {
 
   if (importedFiles.length) {
     try {
-      await ensureDesktopShellItemsHidden(hiddenItems.map(({ definition }) => definition))
+      await ensureDesktopShellItemsHidden(hiddenItems)
       const existingFiles = Array.isArray(widget.data?.files) ? widget.data.files : []
       widget.data = { ...widget.data, files: [...existingFiles, ...importedFiles] }
       await updateWorkspace(nextState)
     } catch (error) {
-      await Promise.all(hiddenItems.map(({ definition, visibility }) => (
+      const rollbacks = await Promise.all(hiddenItems.map(({ definition, visibility }) => (
         setDesktopShellItemVisibility(definition.clsid, visibility).catch(() => {})
       )))
+      if (rollbacks.some((rollback) => rollback?.changed)) await refreshDesktopView().catch(() => {})
       throw error
     }
   }
@@ -1295,17 +1363,23 @@ const removeOrganizerFileReference = async (widgetId, filePath) => {
 const restoreOrganizerShellItem = async (file, position = file.originalDesktopPosition) => {
   const definition = desktopShellItemDefinitionForClsid(file.shellClsid)
   if (!definition) throw new Error('不支持的系统桌面项')
-  const visibility = storedDesktopShellVisibility(file)
-  const update = await setDesktopShellItemVisibility(file.shellClsid, visibility)
-  await ensureDesktopShellItemsRestored([{ definition, visibility }], {
-    requiresShellRestart: update.changed,
-  })
-  if (position) {
-    await restoreDesktopIconPositions([{
-      names: [...new Set([file.name, ...definition.aliases].map((name) => name.toLocaleLowerCase()))],
-      position,
-      required: true,
-    }]).catch(() => 0)
+  const previousGuardNames = await suspendDesktopShellItemGuardFor([{ definition, name: file.name }])
+  try {
+    const visibility = storedDesktopShellVisibility(file)
+    const update = await setDesktopShellItemVisibility(file.shellClsid, visibility)
+    await ensureDesktopShellItemsRestored([{ definition, visibility }], {
+      requiresDesktopRefresh: update.changed,
+    })
+    if (position) {
+      await restoreDesktopIconPositions([{
+        names: [...new Set([file.name, ...definition.aliases].map((name) => name.toLocaleLowerCase()))],
+        position,
+        required: true,
+      }]).catch(() => 0)
+    }
+  } catch (error) {
+    await configureDesktopShellItemGuard(previousGuardNames).catch(() => {})
+    throw error
   }
   return file.path
 }
@@ -1469,7 +1543,6 @@ const releaseOrganizerFileToDesktop = async (widgetId, filePath) => {
 const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
   if (!workspaceState?.widgets) return { restored: 0, errors: [] }
   const preserveOrganizerMembership = options.preserveOrganizerMembership === true
-  const reattachDesktopWindows = options.reattachDesktopWindows !== false
   const nextState = cloneWorkspace()
   const hasDesktopRestorations = nextState.widgets
     .filter((candidate) => candidate.kind === 'organizer')
@@ -1483,6 +1556,10 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
   const protectedDesktopPositions = hasDesktopRestorations
     ? await desktopIconPositionSnapshot().catch(() => [])
     : []
+  const hasShellRestorations = nextState.widgets
+    .filter((candidate) => candidate.kind === 'organizer')
+    .some((widget) => (Array.isArray(widget.data?.files) ? widget.data.files : []).some(isOrganizerShellItem))
+  if (hasShellRestorations) await configureDesktopShellItemGuard([])
   const restoredShellItemNames = new Set(nextState.widgets
     .filter((candidate) => candidate.kind === 'organizer')
     .flatMap((widget) => Array.isArray(widget.data?.files) ? widget.data.files : [])
@@ -1577,8 +1654,7 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
   }
   if (shellVisibilityRestorations.length) {
     await ensureDesktopShellItemsRestored(shellVisibilityRestorations, {
-      reattachDesktopWindows,
-      requiresShellRestart: shellVisibilityChanged,
+      requiresDesktopRefresh: shellVisibilityChanged,
     })
   }
   if (restored || removedReferences) await updateWorkspace(nextState)
@@ -1630,7 +1706,7 @@ const reconcileOrganizerStorage = async () => {
         for (const name of [file.name, ...(definition?.aliases || [])]) {
           if (typeof name === 'string' && name) removedDesktopIconNames.add(name.toLocaleLowerCase())
         }
-        if (definition) shellItemDefinitionsToHide.push(definition)
+        if (definition) shellItemDefinitionsToHide.push({ definition, name: file.name })
         const retainedShellItem = currentDesktopPosition
           ? { ...file, originalDesktopPosition: currentDesktopPosition }
           : file
@@ -1897,7 +1973,10 @@ const updateWorkspace = async (nextState) => {
     ...nextState,
     desktopLayout: nextState?.desktopLayout || workspaceState?.desktopLayout || captureSnapshotDesktop(),
   }
-  syncDesktopWidgetWindows()
+  // Startup storage reconciliation can update the workspace before IPC exists.
+  // Creating renderer windows in that interval makes their first preload calls
+  // fail and forces the windows through an unnecessary blank/timeout cycle.
+  if (ipcHandlersRegistered) syncDesktopWidgetWindows()
   broadcastWorkspace()
   await persistWorkspace()
   if (!snapshotRestoreInProgress) void maybeCreateAutomaticSnapshot('定时自动快照')
@@ -6870,6 +6949,7 @@ const registerIpc = () => {
     if (action === 'tray') minimizeControlToTray()
     if (action === 'quit') requestFullQuit()
   })
+  ipcHandlersRegistered = true
 }
 
 if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
@@ -7955,7 +8035,6 @@ app.on('before-quit', (event) => {
     await createAutomaticSafetySnapshot('退出时自动快照')
     return restoreOrganizerFilesToOriginalLocations({
       preserveOrganizerMembership: true,
-      reattachDesktopWindows: false,
     })
   })
     .then((result) => {

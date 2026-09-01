@@ -324,14 +324,24 @@ const restoreAfterAbruptExit = async (session) => {
   if (shellMoves.length) {
     await helper.request('notify-moves-flush', { moves: shellMoves }, 5_000).catch(() => null)
   }
-  // A crash can leave Explorer's existing Desktop FolderView enumerated with
-  // the old system-icon state even after the registry is restored. Rebuild the
-  // shell once before replaying coordinates so the visible view and saved state
-  // cannot diverge.
+  // Restore the live FolderView once after the registry batch. Restarting
+  // Explorer here destroys the desktop view and can reorder neighbouring icons.
   if (restoredShellItems) {
-    await helper.request('desktop-shell-restart', {}, 12_000).catch((error) => {
-      errors.push(`Windows desktop refresh: ${error.message}`)
-    })
+    let refreshError = null
+    for (const waitMs of [0, 100, 300]) {
+      if (waitMs) await delay(waitMs)
+      try {
+        const refreshed = await helper.request('desktop-view-refresh', {}, 1_500)
+        if (refreshed) {
+          refreshError = null
+          break
+        }
+        refreshError = new Error('Windows desktop view is not ready')
+      } catch (error) {
+        refreshError = error
+      }
+    }
+    if (refreshError) errors.push(`Windows desktop refresh: ${refreshError.message}`)
   }
   if (changed) await atomicWriteJson(workspacePath, workspace)
   await restoreIconPositions(helper, protectedEntries, iconRestorations)
