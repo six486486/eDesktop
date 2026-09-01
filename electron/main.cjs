@@ -3786,8 +3786,8 @@ const desktopWidgetNativeBounds = (win, screenBounds) => {
   }
 }
 
-const desktopWidgetPhysicalClientBounds = (win, screenBounds) => {
-  const display = desktopDisplayById(win?.desktopDisplayId)
+const desktopWidgetPhysicalClientBounds = (win, screenBounds, targetDisplay = null) => {
+  const display = targetDisplay || desktopDisplayById(win?.desktopDisplayId)
   if (!display) return screenBounds
   const physicalBounds = physicalScreenRect(screenBounds)
   const physicalDisplayBounds = physicalScreenRect(display.workArea)
@@ -3882,7 +3882,7 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
     if (typeof host.setShape !== 'function') continue
     const display = desktopDisplayById(host.desktopDisplayId)
     if (!display) continue
-    const ratio = desktopOrganizerHostScaleRatio(host.desktopDisplayId)
+    const shapeUnitScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
     const organizers = workspaceState?.settings.desktopEnabled
       ? workspaceState.widgets.filter((widget) => (
         widget.kind === 'organizer'
@@ -3893,10 +3893,18 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
       : []
     const shape = organizers.flatMap((widget) => {
       const bounds = desktopWidgetWindowBounds(widget)
-      const width = Math.max(1, Math.round(bounds.width * ratio))
-      const height = Math.max(1, Math.round(bounds.height * ratio))
-      const offsetX = Math.round((bounds.x - display.workArea.x) * ratio)
-      const offsetY = Math.round((bounds.y - display.workArea.y) * ratio)
+      // Once the host is parented into Explorer, its region and organizer
+      // children share physical client coordinates. Derive both from the same
+      // screen-to-client conversion. Electron scales BaseWindow.setShape input
+      // by the primary display factor even for this Explorer child, so convert
+      // the physical rectangle back to those input units exactly. Scaling the
+      // original DIP delta by target/primary was only an approximation and
+      // drifted when the organizer crossed displays or the primary changed.
+      const physicalBounds = desktopWidgetPhysicalClientBounds(null, bounds, display)
+      const width = Math.max(1, Math.round(physicalBounds.width / shapeUnitScale))
+      const height = Math.max(1, Math.round(physicalBounds.height / shapeUnitScale))
+      const offsetX = Math.round(physicalBounds.x / shapeUnitScale)
+      const offsetY = Math.round(physicalBounds.y / shapeUnitScale)
       return roundedDesktopOrganizerShape(width, height).map((rect) => ({
         x: offsetX + rect.x,
         y: offsetY + rect.y,
@@ -4638,10 +4646,31 @@ const runDesktopWidgetWindowRegression = () => {
               || desktopWidgetRendererGeometryMismatch(mixedDpiWidget, renderer),
           }
         }
+        const assertMixedDpiHostShape = async (phase) => {
+          const host = desktopOrganizerHostForWindow(mixedDpiWindow)
+          if (!host) throw new Error(`mixed-DPI ${phase} host is missing`)
+          const clientBounds = desktopWidgetPhysicalClientBounds(
+            mixedDpiWindow,
+            desktopWidgetWindowBounds(mixedDpiWidget),
+          )
+          const shapeResult = await runDesktopHostHelper(host, {
+            shapePoint: {
+              x: clientBounds.x + Math.floor(clientBounds.width / 2),
+              y: clientBounds.y + Math.floor(clientBounds.height / 2),
+            },
+          })
+          if (!shapeResult.includes('inside=True')) {
+            throw new Error(`mixed-DPI ${phase} organizer was clipped out: ${JSON.stringify({
+              clientBounds,
+              shapeResult,
+            })}`)
+          }
+        }
         const movedMixedDpiState = await readMixedDpiState()
         if (movedMixedDpiState.mismatch) {
           throw new Error(`mixed-DPI move was not reconciled: ${JSON.stringify(movedMixedDpiState)}`)
         }
+        await assertMixedDpiHostShape('move')
 
         Object.assign(mixedDpiWidget, originalFrame)
         syncDesktopWidgetWindowFrame(mixedDpiWindow, mixedDpiWidget)
@@ -4657,8 +4686,9 @@ const runDesktopWidgetWindowRegression = () => {
         if (restoredMixedDpiState.mismatch) {
           throw new Error(`mixed-DPI restore did not settle: ${JSON.stringify(restoredMixedDpiState)}`)
         }
+        await assertMixedDpiHostShape('restore')
         desktopWidgetGeometryRecoveryTokens.set(mixedDpiWidget.id, Symbol('mixed-dpi-regression-complete'))
-        console.log(`[desktop-geometry] mixed-DPI assertion passed: ${mixedDpiSourceScaleFactor} -> ${mixedDpiTargetScaleFactor} -> ${mixedDpiSourceScaleFactor}`)
+        console.log(`[desktop-geometry] mixed-DPI geometry + host-clip assertion passed: ${mixedDpiSourceScaleFactor} -> ${mixedDpiTargetScaleFactor} -> ${mixedDpiSourceScaleFactor}`)
       } else {
         console.log('[desktop-geometry] mixed-DPI assertion skipped: no displays with different scale factors')
       }
@@ -5627,8 +5657,26 @@ const runDesktopOrganizerPromotionRegression = () => {
             displayScale: display?.scaleFactor,
           })}`)
         }
+        const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
+        const organizerHost = desktopOrganizerHostForWindow(win)
+        if (!widget || !organizerHost) throw new Error('organizer host-shape fixture is incomplete')
+        const physicalClientBounds = desktopWidgetPhysicalClientBounds(win, desktopWidgetWindowBounds(widget))
+        const hostShape = await runDesktopHostHelper(organizerHost, {
+          shapePoint: {
+            x: physicalClientBounds.x + Math.floor(physicalClientBounds.width / 2),
+            y: physicalClientBounds.y + Math.floor(physicalClientBounds.height / 2),
+          },
+        })
+        if (!hostShape.includes('inside=True')) {
+          throw new Error(`organizer was clipped out of its display host: ${JSON.stringify({
+            widgetId: win.desktopWidgetId,
+            displayId: win.desktopDisplayId,
+            physicalClientBounds,
+            hostShape,
+          })}`)
+        }
       }
-      console.log(`[desktop-host] per-display host + mixed-DPI assertion passed: ${organizerDisplayIds.size} hosts`)
+      console.log(`[desktop-host] per-display host + mixed-DPI + native clip assertion passed: ${organizerDisplayIds.size} hosts`)
       for (const win of organizers) {
         const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
         if (widget) savedFrames.set(widget.id, { x: widget.x, y: widget.y, width: widget.width, height: widget.height })

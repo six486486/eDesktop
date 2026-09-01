@@ -1441,21 +1441,33 @@ export function DesktopSurface({ capture = false }: { capture?: boolean }) {
   useEffect(() => {
     const api = window.desktopAPI
     if (!api) return
+    let unlockTimer = 0
     const lockInteraction = (event: PointerEvent) => {
       if ((event.target as HTMLElement | null)?.closest('.desktop-widget')) {
+        if (unlockTimer) window.clearTimeout(unlockTimer)
+        unlockTimer = 0
         api.setDesktopInteractionLocked(true)
       }
     }
     const unlockInteraction = () => {
       if (document.documentElement.dataset.organizerFileDrag === 'true') return
-      api.setDesktopInteractionLocked(false)
+      if (unlockTimer) window.clearTimeout(unlockTimer)
+      // The capture listener runs before WidgetShell's pointer-up handler.
+      // Defer the native unlock until React has submitted the final frame; an
+      // immediate unlock can destroy the old-display organizer while its
+      // pointer-up handler is still committing the cross-display position.
+      unlockTimer = window.setTimeout(() => {
+        unlockTimer = 0
+        api.setDesktopInteractionLocked(false)
+      }, 0)
     }
     window.addEventListener('pointerdown', lockInteraction, true)
     window.addEventListener('pointerup', unlockInteraction, true)
     window.addEventListener('pointercancel', unlockInteraction, true)
     window.addEventListener('blur', unlockInteraction)
     return () => {
-      unlockInteraction()
+      if (unlockTimer) window.clearTimeout(unlockTimer)
+      api.setDesktopInteractionLocked(false)
       window.removeEventListener('pointerdown', lockInteraction, true)
       window.removeEventListener('pointerup', unlockInteraction, true)
       window.removeEventListener('pointercancel', unlockInteraction, true)

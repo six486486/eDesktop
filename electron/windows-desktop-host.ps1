@@ -165,6 +165,9 @@ public static class DesktopHostNative
     public static extern bool PtInRegion(IntPtr region, int x, int y);
 
     [DllImport("gdi32.dll")]
+    public static extern int GetRgnBox(IntPtr region, out RECT rect);
+
+    [DllImport("gdi32.dll")]
     public static extern bool DeleteObject(IntPtr value);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -354,7 +357,9 @@ if ($ShapeClientX -ge 0 -or $ShapeClientY -ge 0) {
   try {
     $regionType = [DesktopHostNative]::GetWindowRgn($window, $shapeRegion)
     $inside = [DesktopHostNative]::PtInRegion($shapeRegion, $ShapeClientX, $ShapeClientY)
-    Write-Output ('shape-point client-x={0} client-y={1} inside={2} region-type={3} hwnd={4}' -f $ShapeClientX, $ShapeClientY, $inside, $regionType, $window.ToInt64())
+    $regionBounds = New-Object DesktopHostNative+RECT
+    [void][DesktopHostNative]::GetRgnBox($shapeRegion, [ref]$regionBounds)
+    Write-Output ('shape-point client-x={0} client-y={1} inside={2} region-type={3} region-box={4},{5},{6},{7} hwnd={8}' -f $ShapeClientX, $ShapeClientY, $inside, $regionType, $regionBounds.Left, $regionBounds.Top, $regionBounds.Right, $regionBounds.Bottom, $window.ToInt64())
   } finally {
     [void][DesktopHostNative]::DeleteObject($shapeRegion)
   }
