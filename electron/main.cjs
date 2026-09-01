@@ -11,6 +11,12 @@ const {
   restoreDesktopIconLayout,
 } = require('./desktop-icon-layout-core.cjs')
 const {
+  desktopShellVisibilityEquals,
+  hiddenDesktopShellVisibility,
+  normalizeDesktopShellVisibility,
+  storedDesktopShellVisibility,
+} = require('./desktop-shell-visibility-core.cjs')
+const {
   remapWorkspaceLayout,
   snapshotSchemaVersion,
   validateSnapshotDocument,
@@ -152,6 +158,7 @@ let activeOrganizerFileSelection = null
 let organizerFileSelectionRevision = 0
 let activeOrganizerContextMenu = null
 let organizerContextMenuSequence = 0
+let desktopShellRestartInFlight = null
 
 const useDesktopWidgetWindows = !capturePath && (
   !desktopHostTest
@@ -608,14 +615,14 @@ const writeDesktopShellItemVisibility = async (clsid, visibility) => (
     clsid,
     exists: Boolean(visibility?.exists),
     value: Number.isFinite(visibility?.value) ? Math.trunc(visibility.value) : 0,
+    states: normalizeDesktopShellVisibility(visibility),
   }, 2_000)
 )
 
 const setDesktopShellItemVisibility = async (clsid, visibility) => {
-  const expected = {
-    exists: Boolean(visibility?.exists),
-    value: Number.isFinite(visibility?.value) ? Math.trunc(visibility.value) : 0,
-  }
+  const expected = normalizeDesktopShellVisibility(visibility)
+  const initial = normalizeDesktopShellVisibility(await desktopShellItemVisibility(clsid))
+  if (desktopShellVisibilityEquals(initial, expected)) return { changed: false }
   let lastError = null
   for (const delayMs of [0, 80, 240]) {
     if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs))
@@ -625,15 +632,85 @@ const setDesktopShellItemVisibility = async (clsid, visibility) => {
       lastError = error
     }
     try {
-      const current = await desktopShellItemVisibility(clsid)
-      const matches = Boolean(current?.exists) === expected.exists
-        && (!expected.exists || Number(current?.value) === expected.value)
-      if (matches) return true
+      const current = normalizeDesktopShellVisibility(await desktopShellItemVisibility(clsid))
+      if (desktopShellVisibilityEquals(current, expected)) return { changed: true }
     } catch (error) {
       lastError = error
     }
   }
   throw lastError || new Error('系统桌面项可见性更新未生效')
+}
+
+const reattachDesktopWindowsAfterShellRestart = async () => {
+  const windows = liveDesktopWindows()
+  if (!windows.length || !workspaceState?.settings.desktopEnabled) return
+  for (const win of windows) {
+    if (win.isDestroyed()) continue
+    win.desktopAttached = false
+    if (isOrganizerWidgetWindow(win)) win.desktopOrganizerChildAttached = false
+  }
+  await attachDesktopWindows()
+  scheduleAllDesktopWidgetGeometryReconcile('explorer-shell-restarted', [120, 420, 1_000])
+}
+
+const restartDesktopShell = async ({ reattachDesktopWindows = true } = {}) => {
+  if (desktopShellRestartInFlight) return desktopShellRestartInFlight
+  desktopShellRestartInFlight = (async () => {
+    const restarted = await desktopIconHelperRequest('desktop-shell-restart', {}, 12_000)
+    if (!restarted) throw new Error('Windows 桌面进程重新加载失败')
+    desktopIconPositionCache.clear()
+    desktopIconPositionCacheUpdatedAt = 0
+    if (reattachDesktopWindows) await reattachDesktopWindowsAfterShellRestart()
+    return true
+  })().finally(() => {
+    desktopShellRestartInFlight = null
+  })
+  return desktopShellRestartInFlight
+}
+
+const verifyDesktopShellVisibilityStates = async (restorations) => {
+  for (const { definition, visibility } of restorations || []) {
+    if (!definition) continue
+    const current = await desktopShellItemVisibility(definition.clsid)
+    if (!desktopShellVisibilityEquals(current, visibility)) {
+      throw new Error(`${definition.aliases[0]}的 Windows 显示设置未生效`)
+    }
+  }
+}
+
+const ensureDesktopShellItemsRestored = async (
+  restorations,
+  { reattachDesktopWindows = true, requiresShellRestart = false } = {},
+) => {
+  const verifiable = (restorations || []).filter(({ definition }) => definition)
+  if (!verifiable.length) return { restored: true, restarted: false }
+  if (requiresShellRestart) {
+    await restartDesktopShell({ reattachDesktopWindows })
+    await new Promise((resolve) => setTimeout(resolve, 900))
+  }
+  await verifyDesktopShellVisibilityStates(verifiable)
+  return { restored: true, restarted: requiresShellRestart }
+}
+
+const ensureDesktopShellItemsHidden = async (definitions, { allowShellRestart = true } = {}) => {
+  const uniqueDefinitions = [...new Map((definitions || [])
+    .filter(Boolean)
+    .map((definition) => [definition.clsid.toLocaleLowerCase(), definition])).values()]
+  if (!uniqueDefinitions.length) return { hidden: true, restarted: false }
+  const updates = await Promise.all(uniqueDefinitions.map((definition) => (
+    setDesktopShellItemVisibility(definition.clsid, hiddenDesktopShellVisibility())
+  )))
+  const requiresShellRestart = updates.some((update) => update?.changed)
+  if (requiresShellRestart && !allowShellRestart) return { hidden: false, restarted: false }
+  if (requiresShellRestart) {
+    await restartDesktopShell()
+    await new Promise((resolve) => setTimeout(resolve, 900))
+  }
+  await verifyDesktopShellVisibilityStates(uniqueDefinitions.map((definition) => ({
+    definition,
+    visibility: hiddenDesktopShellVisibility(),
+  })))
+  return { hidden: true, restarted: requiresShellRestart }
 }
 
 const captureSelectedDesktopShellItems = async () => {
@@ -1108,15 +1185,14 @@ const importOrganizerShellItems = async (widgetId, selectedItems) => {
     if (!definition || existingClsids.has(definition.clsid.toLocaleLowerCase())) continue
     try {
       const visibility = await desktopShellItemVisibility(definition.clsid)
-      if (visibility?.visible === false) continue
+      const visibilityStates = normalizeDesktopShellVisibility(visibility)
       const iconDataUrl = await loadDesktopShellItemIconData(definition)
       const displayName = typeof selection.name === 'string' && selection.name
         ? selection.name
         : definition.aliases[0]
       const shellPath = desktopShellItemPath(definition.clsid)
       const position = selection.position || desktopIconPositionCache.get(displayName.toLocaleLowerCase()) || null
-      await setDesktopShellItemVisibility(definition.clsid, { exists: true, value: 1 })
-      hiddenItems.push({ definition, visibility })
+      hiddenItems.push({ definition, visibility: visibilityStates })
       importedFiles.push({
         id: Buffer.from(shellPath.toLocaleLowerCase()).toString('base64url'),
         path: shellPath,
@@ -1129,8 +1205,9 @@ const importOrganizerShellItems = async (widgetId, selectedItems) => {
         originalPath: shellPath,
         originalDesktopPosition: position,
         shellClsid: definition.clsid,
-        shellVisibilityValueExists: Boolean(visibility?.exists),
-        shellVisibilityValue: Number.isFinite(visibility?.value) ? visibility.value : 0,
+        shellVisibilityValueExists: visibilityStates.newStartPanel.exists,
+        shellVisibilityValue: visibilityStates.newStartPanel.value,
+        shellVisibilityStates: visibilityStates,
       })
       existingClsids.add(definition.clsid.toLocaleLowerCase())
     } catch (error) {
@@ -1140,6 +1217,7 @@ const importOrganizerShellItems = async (widgetId, selectedItems) => {
 
   if (importedFiles.length) {
     try {
+      await ensureDesktopShellItemsHidden(hiddenItems.map(({ definition }) => definition))
       const existingFiles = Array.isArray(widget.data?.files) ? widget.data.files : []
       widget.data = { ...widget.data, files: [...existingFiles, ...importedFiles] }
       await updateWorkspace(nextState)
@@ -1217,9 +1295,10 @@ const removeOrganizerFileReference = async (widgetId, filePath) => {
 const restoreOrganizerShellItem = async (file, position = file.originalDesktopPosition) => {
   const definition = desktopShellItemDefinitionForClsid(file.shellClsid)
   if (!definition) throw new Error('不支持的系统桌面项')
-  await setDesktopShellItemVisibility(file.shellClsid, {
-    exists: Boolean(file.shellVisibilityValueExists),
-    value: Number.isFinite(file.shellVisibilityValue) ? file.shellVisibilityValue : 0,
+  const visibility = storedDesktopShellVisibility(file)
+  const update = await setDesktopShellItemVisibility(file.shellClsid, visibility)
+  await ensureDesktopShellItemsRestored([{ definition, visibility }], {
+    requiresShellRestart: update.changed,
   })
   if (position) {
     await restoreDesktopIconPositions([{
@@ -1390,6 +1469,7 @@ const releaseOrganizerFileToDesktop = async (widgetId, filePath) => {
 const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
   if (!workspaceState?.widgets) return { restored: 0, errors: [] }
   const preserveOrganizerMembership = options.preserveOrganizerMembership === true
+  const reattachDesktopWindows = options.reattachDesktopWindows !== false
   const nextState = cloneWorkspace()
   const hasDesktopRestorations = nextState.widgets
     .filter((candidate) => candidate.kind === 'organizer')
@@ -1414,6 +1494,8 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
     .filter((name) => typeof name === 'string' && name)
     .map((name) => name.toLocaleLowerCase()))
   const iconRestorations = []
+  const shellVisibilityRestorations = []
+  let shellVisibilityChanged = false
   const shellMoves = []
   const errors = []
   let restored = 0
@@ -1426,10 +1508,10 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
       if (isOrganizerShellItem(file)) {
         try {
           const definition = desktopShellItemDefinitionForClsid(file.shellClsid)
-          await setDesktopShellItemVisibility(file.shellClsid, {
-            exists: Boolean(file.shellVisibilityValueExists),
-            value: Number.isFinite(file.shellVisibilityValue) ? file.shellVisibilityValue : 0,
-          })
+          const visibility = storedDesktopShellVisibility(file)
+          const update = await setDesktopShellItemVisibility(file.shellClsid, visibility)
+          shellVisibilityChanged = shellVisibilityChanged || update.changed
+          shellVisibilityRestorations.push({ definition, visibility })
           if (definition && file.originalDesktopPosition) {
             iconRestorations.push({
               names: [...new Set([file.name, ...definition.aliases].map((name) => name.toLocaleLowerCase()))],
@@ -1493,6 +1575,12 @@ const restoreOrganizerFilesToOriginalLocations = async (options = {}) => {
     // replayed. Otherwise a delayed desktop refresh can reorder icons after we quit.
     await notifyShellMoves(shellMoves, { flush: true })
   }
+  if (shellVisibilityRestorations.length) {
+    await ensureDesktopShellItemsRestored(shellVisibilityRestorations, {
+      reattachDesktopWindows,
+      requiresShellRestart: shellVisibilityChanged,
+    })
+  }
   if (restored || removedReferences) await updateWorkspace(nextState)
   await restoreDesktopIconPositions([
     ...protectedDesktopPositions.filter((entry) => (
@@ -1523,6 +1611,7 @@ const reconcileOrganizerStorage = async () => {
     ? await desktopIconPositionSnapshot().catch(() => [])
     : []
   const removedDesktopIconNames = new Set()
+  const shellItemDefinitionsToHide = []
   for (const widget of nextState.widgets.filter((candidate) => candidate.kind === 'organizer')) {
     const storagePath = organizerStoragePath(widget.id)
     await fs.promises.mkdir(storagePath, { recursive: true })
@@ -1541,7 +1630,7 @@ const reconcileOrganizerStorage = async () => {
         for (const name of [file.name, ...(definition?.aliases || [])]) {
           if (typeof name === 'string' && name) removedDesktopIconNames.add(name.toLocaleLowerCase())
         }
-        await setDesktopShellItemVisibility(file.shellClsid, { exists: true, value: 1 }).catch(() => {})
+        if (definition) shellItemDefinitionsToHide.push(definition)
         const retainedShellItem = currentDesktopPosition
           ? { ...file, originalDesktopPosition: currentDesktopPosition }
           : file
@@ -1627,6 +1716,9 @@ const reconcileOrganizerStorage = async () => {
       changed = true
     }
     widget.data = { ...widget.data, files: retainedFiles }
+  }
+  if (shellItemDefinitionsToHide.length) {
+    await ensureDesktopShellItemsHidden(shellItemDefinitionsToHide)
   }
   if (shellMoves.length) await notifyShellMoves(shellMoves, { flush: true })
   if (changed) await updateWorkspace(nextState)
@@ -7863,6 +7955,7 @@ app.on('before-quit', (event) => {
     await createAutomaticSafetySnapshot('退出时自动快照')
     return restoreOrganizerFilesToOriginalLocations({
       preserveOrganizerMembership: true,
+      reattachDesktopWindows: false,
     })
   })
     .then((result) => {

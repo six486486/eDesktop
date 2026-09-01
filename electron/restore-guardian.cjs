@@ -2,6 +2,7 @@ const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 const { restoreDesktopIconLayout } = require('./desktop-icon-layout-core.cjs')
+const { storedDesktopShellVisibility } = require('./desktop-shell-visibility-core.cjs')
 
 const args = new Map()
 for (let index = 2; index < process.argv.length; index += 2) {
@@ -217,6 +218,7 @@ const restoreAfterAbruptExit = async (session) => {
   }))
   const iconRestorations = []
   const shellMoves = []
+  let restoredShellItems = 0
   const errors = []
   let restored = 0
   let changed = false
@@ -229,10 +231,12 @@ const restoreAfterAbruptExit = async (session) => {
     const nextFiles = []
     for (const file of files) {
       if (typeof file?.shellClsid === 'string' && file.shellClsid) {
+        const visibility = storedDesktopShellVisibility(file)
         const result = await helper.request('shell-item-visibility-set', {
           clsid: file.shellClsid,
-          exists: Boolean(file.shellVisibilityValueExists),
-          value: Number.isFinite(file.shellVisibilityValue) ? Math.trunc(file.shellVisibilityValue) : 0,
+          exists: visibility.newStartPanel.exists,
+          value: visibility.newStartPanel.value,
+          states: visibility,
         }, 2_000).catch((error) => ({ error }))
         if (result?.error) {
           errors.push(`${file.name || file.shellClsid}: ${result.error.message}`)
@@ -248,6 +252,7 @@ const restoreAfterAbruptExit = async (session) => {
           })
         }
         nextFiles.push({ ...file, temporarilyRestoredOnExit: true })
+        restoredShellItems += 1
         restored += 1
         changed = true
         continue
@@ -318,6 +323,15 @@ const restoreAfterAbruptExit = async (session) => {
 
   if (shellMoves.length) {
     await helper.request('notify-moves-flush', { moves: shellMoves }, 5_000).catch(() => null)
+  }
+  // A crash can leave Explorer's existing Desktop FolderView enumerated with
+  // the old system-icon state even after the registry is restored. Rebuild the
+  // shell once before replaying coordinates so the visible view and saved state
+  // cannot diverge.
+  if (restoredShellItems) {
+    await helper.request('desktop-shell-restart', {}, 12_000).catch((error) => {
+      errors.push(`Windows desktop refresh: ${error.message}`)
+    })
   }
   if (changed) await atomicWriteJson(workspacePath, workspace)
   await restoreIconPositions(helper, protectedEntries, iconRestorations)

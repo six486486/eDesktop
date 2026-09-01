@@ -16,6 +16,7 @@ Add-Type -AssemblyName System.Drawing
 $source = @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -1072,6 +1073,61 @@ public static class DesktopIconNative
         return true;
     }
 
+    public static int GetDesktopShellProcessId()
+    {
+        IntPtr shellWindow = FindWindow("Shell_TrayWnd", null);
+        if (shellWindow == IntPtr.Zero) return 0;
+        uint processId;
+        GetWindowThreadProcessId(shellWindow, out processId);
+        return unchecked((int)processId);
+    }
+
+    public static bool RestartDesktopShell()
+    {
+        int previousProcessId = GetDesktopShellProcessId();
+        if (previousProcessId <= 0) return false;
+        try
+        {
+            Process shellProcess = Process.GetProcessById(previousProcessId);
+            shellProcess.Kill();
+            shellProcess.WaitForExit(5000);
+            shellProcess.Dispose();
+        }
+        catch
+        {
+            return false;
+        }
+
+        // AutoRestartShell normally creates the replacement. Start Explorer
+        // ourselves only if Windows has not done so, avoiding an extra folder
+        // window when the automatic restart was already successful.
+        for (int attempt = 0; attempt < 30; attempt++)
+        {
+            Thread.Sleep(100);
+            int currentProcessId = GetDesktopShellProcessId();
+            if (currentProcessId > 0 && currentProcessId != previousProcessId) break;
+            if (attempt == 14)
+            {
+                string explorerPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    "explorer.exe"
+                );
+                Process.Start(explorerPath);
+            }
+        }
+
+        for (int attempt = 0; attempt < 50; attempt++)
+        {
+            if (FindListView() != IntPtr.Zero)
+            {
+                RefreshShellIcons();
+                return true;
+            }
+            Thread.Sleep(100);
+        }
+        return false;
+    }
+
     public static bool SetItemPosition(string name, int x, int y)
     {
         return SetItemPositions(new[] { new DesktopIconInfo { Name = name, X = x, Y = y } }).Length > 0;
@@ -1266,29 +1322,52 @@ function Get-ShortcutInfo([string]$ShortcutPath, $ShortcutShell) {
   }
 }
 
-$desktopIconVisibilityKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel'
+$desktopIconVisibilityKeyPaths = [ordered]@{
+  newStartPanel = 'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel'
+  classicStartMenu = 'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\ClassicStartMenu'
+}
 
 function Get-DesktopShellItemVisibility([string]$Clsid) {
-  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($desktopIconVisibilityKeyPath)
-  try {
-    $exists = @($key.GetValueNames()) -contains $Clsid
-    $value = if ($exists) { [int]$key.GetValue($Clsid, 0) } else { 0 }
-    return @{ exists = $exists; value = $value; visible = (-not $exists -or $value -eq 0) }
-  } finally {
-    $key.Dispose()
+  $locations = [ordered]@{}
+  foreach ($entry in $desktopIconVisibilityKeyPaths.GetEnumerator()) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($entry.Value)
+    try {
+      $exists = @($key.GetValueNames()) -contains $Clsid
+      $value = if ($exists) { [int]$key.GetValue($Clsid, 0) } else { 0 }
+      $locations[$entry.Key] = @{ exists = $exists; value = $value }
+    } finally {
+      $key.Dispose()
+    }
+  }
+  $primary = $locations.newStartPanel
+  return @{
+    exists = $primary.exists
+    value = $primary.value
+    visible = (-not $primary.exists -or $primary.value -eq 0)
+    locations = $locations
   }
 }
 
-function Set-DesktopShellItemVisibility([string]$Clsid, [bool]$Exists, [int]$Value) {
-  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($desktopIconVisibilityKeyPath)
-  try {
-    if ($Exists) {
-      $key.SetValue($Clsid, $Value, [Microsoft.Win32.RegistryValueKind]::DWord)
+function Set-DesktopShellItemVisibility([string]$Clsid, [bool]$Exists, [int]$Value, $States = $null) {
+  foreach ($entry in $desktopIconVisibilityKeyPaths.GetEnumerator()) {
+    $state = if ($null -ne $States -and $null -ne $States.($entry.Key)) {
+      $States.($entry.Key)
+    } elseif ($entry.Key -eq 'newStartPanel') {
+      @{ exists = $Exists; value = $Value }
     } else {
-      $key.DeleteValue($Clsid, $false)
+      $null
     }
-  } finally {
-    $key.Dispose()
+    if ($null -eq $state) { continue }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($entry.Value)
+    try {
+      if ([bool]$state.exists) {
+        $key.SetValue($Clsid, [int]$state.value, [Microsoft.Win32.RegistryValueKind]::DWord)
+      } else {
+        $key.DeleteValue($Clsid, $false)
+      }
+    } finally {
+      $key.Dispose()
+    }
   }
   [DesktopIconNative]::RefreshShellIcons() | Out-Null
   return $true
@@ -1313,7 +1392,9 @@ if ($Mode -eq 'server') {
       } elseif ($request.command -eq 'shell-item-visibility-get') {
         $result = Get-DesktopShellItemVisibility ([string]$request.clsid)
       } elseif ($request.command -eq 'shell-item-visibility-set') {
-        $result = Set-DesktopShellItemVisibility ([string]$request.clsid) ([bool]$request.exists) ([int]$request.value)
+        $result = Set-DesktopShellItemVisibility ([string]$request.clsid) ([bool]$request.exists) ([int]$request.value) $request.states
+      } elseif ($request.command -eq 'desktop-shell-restart') {
+        $result = [DesktopIconNative]::RestartDesktopShell()
       } elseif ($request.command -eq 'set') {
         $result = [DesktopIconNative]::SetItemPosition([string]$request.name, [int]$request.x, [int]$request.y)
       } elseif ($request.command -eq 'set-many') {
