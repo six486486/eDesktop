@@ -3955,14 +3955,13 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
     const display = desktopDisplayById(host.desktopDisplayId)
     if (!display) continue
     const shapeUnitScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
+    // Only the active workspace HWND may contribute to the visible host
+    // region. A transparent, prewarmed replacement in a sibling per-DPI host
+    // would otherwise occlude the still-visible source HWND before hand-off,
+    // making the organizer look clipped or disappear during the drag.
     const organizerWindows = workspaceState?.settings.desktopEnabled
-      ? [...new Set([
-          ...workspaceDesktopOrganizerWindows(),
-          ...desktopOrganizerTransitionWindows,
-        ])].filter((win) => (
-          win
-          && !win.isDestroyed()
-          && win.desktopDisplayId === host.desktopDisplayId
+      ? workspaceDesktopOrganizerWindows().filter((win) => (
+          win.desktopDisplayId === host.desktopDisplayId
         ))
       : []
     const shape = organizerWindows.flatMap((organizerWindow) => {
@@ -3998,6 +3997,18 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
       // A hidden, one-pixel host is safer than an empty region whose exact
       // interpretation differs across Electron/Windows versions.
       if (!shape.length) {
+        if ((host.desktopOrganizerPrewarmCount || 0) > 0) {
+          const prewarmSignature = `prewarm:${host.desktopDisplayId}`
+          if (host.desktopOrganizerShapeSignature !== prewarmSignature) {
+            host.setShape([{ x: 0, y: 0, width: 1, height: 1 }])
+            host.desktopOrganizerShapeSignature = prewarmSignature
+          }
+          if (host.desktopOrganizerHostAttached && !host.isVisible()) {
+            host.showInactive()
+            void syncDesktopOrganizerHostBounds(host, display)
+          }
+          continue
+        }
         host.desktopOrganizerShapeSignature = signature
         host.hide()
         continue
@@ -4101,12 +4112,46 @@ const recreateDesktopOrganizerWindow = async (win, widget, reason = 'geometry-re
   return createDesktopWidgetWindow(widget)
 }
 
+const prewarmDesktopOrganizerHost = async (displayId) => {
+  const normalizedDisplayId = String(displayId)
+  const host = await ensureDesktopOrganizerHostWindow(normalizedDisplayId)
+  const display = desktopDisplayById(normalizedDisplayId)
+  if (!host || host.isDestroyed() || !display) return host
+  host.desktopOrganizerPrewarmCount = (host.desktopOrganizerPrewarmCount || 0) + 1
+  if (host.isVisible()) return host
+  try {
+    // Keep a hidden host natively laid out without giving it the organizer's
+    // real region. This avoids BaseWindow.showInactive replaying a stale frame
+    // at the actual hand-off, while a single corner pixel cannot cover the
+    // source organizer during prewarm.
+    host.setShape([{ x: 0, y: 0, width: 1, height: 1 }])
+    host.desktopOrganizerShapeSignature = `prewarm:${normalizedDisplayId}`
+    host.showInactive()
+    await syncDesktopOrganizerHostBounds(host, display)
+    return host
+  } catch (error) {
+    console.warn(`[desktop-host] display=${normalizedDisplayId} prewarm failed: ${error.message}`)
+    return host
+  }
+}
+
+const releaseDesktopOrganizerHostPrewarm = (displayId, { applyShape = true } = {}) => {
+  const host = desktopOrganizerHostForDisplay(displayId)
+  if (!host) return
+  host.desktopOrganizerPrewarmCount = Math.max(0, (host.desktopOrganizerPrewarmCount || 0) - 1)
+  if (applyShape) applyDesktopOrganizerHostShape(displayId)
+}
+
 const cancelPreparedDesktopOrganizerTransition = (win) => {
   const prepared = win?.desktopPreparedDisplayTransition
   if (!prepared) return
   prepared.cancelled = true
   if (prepared.replacement && !prepared.replacement.isDestroyed()) prepared.replacement.destroy()
   win.desktopPreparedDisplayTransition = null
+  if (prepared.hostPrewarmed) {
+    prepared.hostPrewarmed = false
+    releaseDesktopOrganizerHostPrewarm(prepared.displayId)
+  }
 }
 
 const prepareDesktopOrganizerTransition = (win, displayId) => {
@@ -4123,10 +4168,19 @@ const prepareDesktopOrganizerTransition = (win, displayId) => {
     promise: null,
   }
   prepared.promise = (async () => {
-    await ensureDesktopOrganizerHostWindow(normalizedDisplayId)
-    if (prepared.cancelled || win.isDestroyed()) return null
+    await prewarmDesktopOrganizerHost(normalizedDisplayId)
+    prepared.hostPrewarmed = true
+    if (prepared.cancelled || win.isDestroyed()) {
+      prepared.hostPrewarmed = false
+      releaseDesktopOrganizerHostPrewarm(normalizedDisplayId)
+      return null
+    }
     const widget = workspaceState?.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
-    if (!widget || desktopWidgetDisplayId(widget) !== normalizedDisplayId) return null
+    if (!widget || desktopWidgetDisplayId(widget) !== normalizedDisplayId) {
+      prepared.hostPrewarmed = false
+      releaseDesktopOrganizerHostPrewarm(normalizedDisplayId)
+      return null
+    }
     const replacement = createDesktopWidgetWindow(widget, {
       replacement: true,
       deferReveal: true,
@@ -4202,6 +4256,10 @@ const transitionDesktopOrganizerToDisplay = async (win, displayId) => {
       && replacement.desktopOrganizerChildAttached === true
     )
     desktopWidgetWindows.set(widget.id, replacement)
+    if (win.desktopPreparedDisplayTransition?.hostPrewarmed) {
+      win.desktopPreparedDisplayTransition.hostPrewarmed = false
+      releaseDesktopOrganizerHostPrewarm(normalizedDisplayId, { applyShape: false })
+    }
     win.desktopPreparedDisplayTransition = null
     replacement.desktopIsTransitionReplacement = false
     applyDesktopOrganizerHostShape(normalizedDisplayId)
@@ -4566,6 +4624,8 @@ const createDesktopWidgetWindow = (widget, options = {}) => {
         if (typeof win.webContents.invalidate === 'function') win.webContents.invalidate()
         await win.webContents.capturePage()
         win.setOpacity(0)
+        win.setIgnoreMouseEvents(true)
+        win.desktopPointerInteractive = false
         win.desktopFirstFrameRevealed = false
       } else {
         await revealDesktopWidgetFirstFrame(win)
@@ -4864,6 +4924,8 @@ const runDesktopWidgetWindowRegression = () => {
           height: mixedDpiWidget.height,
         }
         const virtualBounds = virtualScreenBounds()
+        const mixedDpiTargetHost = desktopOrganizerHostForDisplay(mixedDpiTargetDisplay.id)
+        const mixedDpiTargetShapeBefore = mixedDpiTargetHost?.desktopOrganizerShapeSignature
         mixedDpiWidget.x = mixedDpiTargetDisplay.workArea.x - virtualBounds.x + 24
         mixedDpiWidget.y = mixedDpiTargetDisplay.workArea.y - virtualBounds.y + 40
         const dragPreviewHandle = getWindowHandle(mixedDpiWindow)
@@ -4880,6 +4942,25 @@ const runDesktopWidgetWindowRegression = () => {
           && Date.now() < previewDeadline
         ) {
           await new Promise((resolve) => setTimeout(resolve, 30))
+        }
+        const preparedPreviewWindow = await mixedDpiWindow.desktopPreparedDisplayTransition?.promise
+        if (
+          !preparedPreviewWindow
+          || preparedPreviewWindow.isDestroyed()
+          || preparedPreviewWindow.getOpacity() !== 0
+          || preparedPreviewWindow.desktopPointerInteractive !== false
+          || (
+            mixedDpiTargetShapeBefore
+            && mixedDpiTargetHost?.desktopOrganizerShapeSignature !== mixedDpiTargetShapeBefore
+          )
+        ) {
+          throw new Error(`mixed-DPI prewarm became visible before pointer-up: ${JSON.stringify({
+            prepared: Boolean(preparedPreviewWindow && !preparedPreviewWindow.isDestroyed()),
+            opacity: preparedPreviewWindow?.isDestroyed() ? null : preparedPreviewWindow?.getOpacity(),
+            pointerInteractive: preparedPreviewWindow?.desktopPointerInteractive,
+            targetShapeBefore: mixedDpiTargetShapeBefore,
+            targetShapeAfter: mixedDpiTargetHost?.desktopOrganizerShapeSignature,
+          })}`)
         }
         const previewMetrics = await desktopIconHelperRequest('window-geometries', {
           hwnds: [dragPreviewHandle],
