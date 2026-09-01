@@ -2612,14 +2612,14 @@ const desktopWidgetGeometryMetricValue = (metric, key) => metric?.[key] ?? metri
 const desktopWidgetExpectedPhysicalSize = (widget, metric) => {
   const requestedBounds = desktopWidgetWindowBounds(widget)
   const widgetWindow = desktopWidgetWindows.get(widget.id)
-  const organizerUsesExplorerScale = useIndividualOrganizerDesktopChildren
+  const organizerUsesPerDisplayScale = useIndividualOrganizerDesktopChildren
     && widgetWindow
     && isOrganizerWidgetWindow(widgetWindow)
-  const display = !organizerUsesExplorerScale && widgetWindow && isOrganizerWidgetWindow(widgetWindow)
+  const display = widgetWindow && isOrganizerWidgetWindow(widgetWindow)
     ? desktopDisplayById(widgetWindow.desktopDisplayId)
     : null
-  const scaleFactor = organizerUsesExplorerScale
-    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+  const scaleFactor = organizerUsesPerDisplayScale
+    ? Number(display?.scaleFactor) || 1
     : display?.scaleFactor || (Number(desktopWidgetGeometryMetricValue(metric, 'Dpi')) || 96) / 96
   return {
     width: Math.max(1, Math.round(requestedBounds.width * scaleFactor)),
@@ -2695,12 +2695,25 @@ const inspectDesktopWidgetRendererGeometry = async (win) => {
   }
 }
 
+const desktopRendererPointToNativeClient = async (win, point) => {
+  const metricsResult = await desktopIconHelperRequest('window-geometries', {
+    hwnds: [getWindowHandle(win)],
+  }, 1_200)
+  const metric = Array.isArray(metricsResult) ? metricsResult[0] : metricsResult
+  const renderer = await inspectDesktopWidgetRendererGeometry(win)
+  const clientWidth = Number(desktopWidgetGeometryMetricValue(metric, 'ClientWidth')) || renderer?.innerWidth || 1
+  const clientHeight = Number(desktopWidgetGeometryMetricValue(metric, 'ClientHeight')) || renderer?.innerHeight || 1
+  const nativeClientScale = Math.max(0.25, (Number(desktopWidgetGeometryMetricValue(metric, 'Dpi')) || 96) / 96)
+  return {
+    x: point.x * clientWidth / Math.max(1, Number(renderer?.innerWidth) || clientWidth) / nativeClientScale,
+    y: point.y * clientHeight / Math.max(1, Number(renderer?.innerHeight) || clientHeight) / nativeClientScale,
+  }
+}
+
 const desktopWidgetRendererGeometryMismatch = (widget, renderer) => {
   if (!renderer) return true
   const targetDisplay = screen.getAllDisplays().find((display) => String(display.id) === desktopWidgetDisplayId(widget))
-  const expectedRendererScale = widget.kind === 'organizer' && useIndividualOrganizerDesktopChildren
-    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
-    : targetDisplay?.scaleFactor
+  const expectedRendererScale = targetDisplay?.scaleFactor
   const innerWidth = Number(renderer.innerWidth)
   const innerHeight = Number(renderer.innerHeight)
   const widgetWidth = Number(renderer.widgetWidth)
@@ -3140,7 +3153,7 @@ const lowerDesktopOrganizerWindow = async (win) => {
     win.desktopOrganizerLayerResult = hostResult
     win.desktopOrganizerChildAttached = hostResult.includes('placement=desktop-child')
     win.desktopOrganizerLayeredAt = Date.now()
-    if (!useIndividualOrganizerDesktopChildren) syncDesktopOrganizerRendererScale(win)
+    if (!useIndividualOrganizerDesktopChildren) void syncDesktopOrganizerRendererScale(win)
     win.desktopOrganizerShapeApplied = false
     const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
     if (widget) {
@@ -3225,7 +3238,7 @@ const attachDesktopWindow = async (win) => {
     if (organizerWindow) {
       win.desktopOrganizerLayerResult = hostResult
       win.desktopOrganizerChildAttached = hostResult.includes('placement=desktop-child')
-      if (!useIndividualOrganizerDesktopChildren) syncDesktopOrganizerRendererScale(win)
+      if (!useIndividualOrganizerDesktopChildren) void syncDesktopOrganizerRendererScale(win)
       win.desktopOrganizerShapeApplied = false
       const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
       if (widget) {
@@ -3858,11 +3871,15 @@ const desktopWidgetNativeBounds = (win, screenBounds) => {
   if (!win?.desktopOrganizerChildAttached) return screenBounds
   if (useIndividualOrganizerDesktopChildren) {
     const clientBounds = desktopWidgetPhysicalClientBounds(win, screenBounds)
+    const shapeUnitScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
     return {
       x: 0,
       y: 0,
-      width: clientBounds.width,
-      height: clientBounds.height,
+      // Electron scales BrowserWindow.setShape input with the primary display
+      // factor even after this HWND becomes an Explorer child. Convert the
+      // target display's physical client size back into those input units.
+      width: Math.max(1, Math.round(clientBounds.width / shapeUnitScale)),
+      height: Math.max(1, Math.round(clientBounds.height / shapeUnitScale)),
     }
   }
   const display = desktopDisplayById(win.desktopDisplayId)
@@ -3879,17 +3896,20 @@ const desktopWidgetNativeBounds = (win, screenBounds) => {
 const desktopWidgetPhysicalClientBounds = (win, screenBounds) => {
   const physicalBounds = physicalScreenRect(screenBounds)
   const physicalVirtualBounds = physicalVirtualScreenBounds()
-  const usesStableExplorerScale = useIndividualOrganizerDesktopChildren
+  const usesPerDisplayOrganizerScale = useIndividualOrganizerDesktopChildren
     && (!win || isOrganizerWidgetWindow(win))
-  const sizeScale = usesStableExplorerScale
-    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+  const sizeScale = usesPerDisplayOrganizerScale
+    ? Number((win
+        ? desktopDisplayById(win.desktopDisplayId)
+        : screen.getDisplayMatching(screenBounds))?.scaleFactor) || 1
     : null
   return {
     x: Math.round(physicalBounds.x - physicalVirtualBounds.x),
     y: Math.round(physicalBounds.y - physicalVirtualBounds.y),
-    // Explorer's desktop children share the primary desktop host DPI. Keep a
-    // single physical size basis on every monitor; changing this scale at the
-    // monitor boundary is what made the organizer visibly grow or shrink.
+    // Match normal Windows per-monitor sizing: the logical widget dimensions
+    // stay constant while its physical pixel dimensions follow the display.
+    // Use win.desktopDisplayId during a native drag because the persisted
+    // widget position still describes the source display until pointer-up.
     width: Math.max(1, Math.round(sizeScale ? screenBounds.width * sizeScale : physicalBounds.width)),
     height: Math.max(1, Math.round(sizeScale ? screenBounds.height * sizeScale : physicalBounds.height)),
   }
@@ -3949,11 +3969,11 @@ const setDesktopWidgetWindowPosition = (win, screenX, screenY) => {
   win.setPosition(screenX, screenY, false)
 }
 
-const roundedDesktopOrganizerShape = (width, height) => {
+const roundedDesktopOrganizerShape = (width, height, requestedRadius = desktopOrganizerNativeShapeRadius) => {
   const safeWidth = Math.max(1, Math.round(width))
   const safeHeight = Math.max(1, Math.round(height))
   const radius = Math.min(
-    desktopOrganizerNativeShapeRadius,
+    Math.max(0, Math.round(requestedRadius)),
     Math.floor(safeWidth / 2),
     Math.floor(safeHeight / 2),
   )
@@ -4088,13 +4108,18 @@ const rebuildDesktopOrganizerHosts = async () => {
 
 const applyDesktopOrganizerWindowShape = (win, bounds) => {
   if (!win || win.isDestroyed() || typeof win.setShape !== 'function') return
-  const signature = `${Math.max(1, Math.round(bounds.width))}x${Math.max(1, Math.round(bounds.height))}@${desktopOrganizerNativeShapeRadius}`
+  const primaryScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
+  const targetScale = Number(desktopDisplayById(win.desktopDisplayId)?.scaleFactor) || primaryScale
+  const shapeRadius = win.desktopOrganizerChildAttached && useIndividualOrganizerDesktopChildren
+    ? desktopOrganizerNativeShapeRadius * targetScale / primaryScale
+    : desktopOrganizerNativeShapeRadius
+  const signature = `${Math.max(1, Math.round(bounds.width))}x${Math.max(1, Math.round(bounds.height))}@${shapeRadius.toFixed(3)}`
   if (win.desktopOrganizerShapeSignature === signature) {
     win.desktopOrganizerShapeApplied = true
     return
   }
   try {
-    win.setShape(roundedDesktopOrganizerShape(bounds.width, bounds.height))
+    win.setShape(roundedDesktopOrganizerShape(bounds.width, bounds.height, shapeRadius))
     win.desktopOrganizerShapeSignature = signature
     win.desktopOrganizerShapeMutationCount = (win.desktopOrganizerShapeMutationCount || 0) + 1
     win.desktopOrganizerShapeApplied = true
@@ -4131,6 +4156,10 @@ const syncDesktopOrganizerNativeSurfaceSize = async (win) => {
       physicalWidth: physical.width,
       physicalHeight: physical.height,
     }, 1_200)
+    applyDesktopOrganizerWindowShape(win, desktopWidgetNativeBounds(
+      win,
+      desktopWidgetWindowBounds(widget),
+    ))
     return true
   } catch (error) {
     if (!win.desktopRenderChildBoundsWarningLogged) {
@@ -4141,22 +4170,32 @@ const syncDesktopOrganizerNativeSurfaceSize = async (win) => {
   }
 }
 
-const syncDesktopOrganizerRendererScale = (win) => {
+const syncDesktopOrganizerRendererScale = async (win) => {
   if (!isOrganizerWidgetWindow(win) || win.webContents.isDestroyed()) return 1
-  const explorerScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
-  const displayScale = Number(desktopDisplayById(win.desktopDisplayId)?.scaleFactor) || explorerScale
-  // A desktop child receives WM_DPICHANGED as it crosses monitors even though
-  // its physical frame intentionally stays fixed. Counter that monitor scale
-  // in page zoom so the DOM viewport, hit targets and visual size remain
-  // constant without replacing the BrowserWindow.
-  const zoomFactor = explorerScale / displayScale
-  const currentZoomFactor = Number(win.webContents.getZoomFactor()) || 1
-  if (Math.abs(currentZoomFactor - zoomFactor) > 0.001) {
-    win.webContents.setZoomFactor(zoomFactor)
-    void syncDesktopOrganizerNativeSurfaceSize(win)
+  const expectedDisplayId = String(win.desktopDisplayId)
+  const targetScale = Number(desktopDisplayById(expectedDisplayId)?.scaleFactor) || 1
+  try {
+    const currentZoomFactor = Number(win.webContents.getZoomFactor()) || 1
+    const currentDpr = Number(await win.webContents.executeJavaScript('window.devicePixelRatio')) || currentZoomFactor
+    if (
+      win.isDestroyed()
+      || win.webContents.isDestroyed()
+      || String(win.desktopDisplayId) !== expectedDisplayId
+    ) return Number(win.webContents.getZoomFactor()) || 1
+    // Explorer children do not receive WM_DPICHANGED deterministically: the
+    // Chromium base DPI may already match the destination monitor or may still
+    // be inherited from Explorer. Derive the live unzoomed DPI instead of
+    // assuming either state, then make effective DPR converge to targetScale.
+    const rendererBaseScale = Math.max(0.25, currentDpr / currentZoomFactor)
+    const zoomFactor = Math.max(0.25, Math.min(5, targetScale / rendererBaseScale))
+    if (Math.abs(currentZoomFactor - zoomFactor) > 0.001) {
+      win.webContents.setZoomFactor(zoomFactor)
+    }
+    win.desktopOrganizerZoomFactor = zoomFactor
+    return zoomFactor
+  } catch {
+    return Number(win.webContents.getZoomFactor()) || 1
   }
-  win.desktopOrganizerZoomFactor = zoomFactor
-  return zoomFactor
 }
 
 const scheduleDesktopOrganizerScaleStabilization = (win, displayId = win?.desktopDisplayId) => {
@@ -4165,14 +4204,10 @@ const scheduleDesktopOrganizerScaleStabilization = (win, displayId = win?.deskto
   for (const delay of [60, 180, 360]) {
     setTimeout(() => {
       if (win.isDestroyed() || win.desktopDisplayId !== expectedDisplayId) return
-      // WM_DPICHANGED can arrive after the native move notification. Reapply
-      // the stable Explorer-scale viewport to this same HWND once the monitor
-      // transition has settled; no sibling window or z-order is touched.
-      win.webContents.setZoomFactor(
-        (Number(screen.getPrimaryDisplay().scaleFactor) || 1)
-        / (Number(desktopDisplayById(expectedDisplayId)?.scaleFactor) || 1),
-      )
-      syncDesktopOrganizerRendererScale(win)
+      // WM_DPICHANGED can arrive after the native move notification. Recompute
+      // from Chromium's live base DPI and reapply the target display's exact
+      // physical size to this same HWND; no sibling z-order is touched.
+      void syncDesktopOrganizerRendererScale(win)
       void syncDesktopOrganizerNativeSurfaceSize(win)
     }, delay)
   }
@@ -4185,15 +4220,19 @@ const syncDesktopWidgetWindowFrame = (win, widget) => {
   if (widget.kind === 'organizer') {
     // A standalone organizer owns one HWND for its whole lifetime. Do not
     // prewarm, replace, hide or recreate it when its centre crosses a display.
-    // Explorer supplies one desktop-child coordinate space and one stable DPI;
-    // moving that HWND directly is both smoother and preserves pointer offset.
+    // Explorer supplies one desktop-child coordinate space; moving that HWND
+    // directly preserves pointer offset while per-monitor scaling is reconciled
+    // on the same window without replacement.
     win.desktopPendingDisplayId = null
   }
   win.desktopDisplayId = nextDisplayId
   if (widget.kind === 'organizer') {
     if (!win.desktopAttachmentInFlight) {
-      syncDesktopOrganizerRendererScale(win)
-      if (displayChanged) scheduleDesktopOrganizerScaleStabilization(win, nextDisplayId)
+      void syncDesktopOrganizerRendererScale(win)
+      if (displayChanged) {
+        void syncDesktopOrganizerNativeSurfaceSize(win)
+        scheduleDesktopOrganizerScaleStabilization(win, nextDisplayId)
+      }
     }
   }
   const nextBounds = desktopWidgetWindowBounds(widget)
@@ -4372,10 +4411,10 @@ const stabilizeAttachedDesktopOrganizerGeometry = async (win, widget) => {
     await new Promise((resolve) => setTimeout(resolve, 40))
     await runDesktopHostHelper(win, { clientBounds })
     // SetParent/SetWindowPos deliver WM_DPICHANGED asynchronously to Chromium.
-    // Wait for that message before applying the compensating page scale so the
-    // first visible frame is already at the stable Explorer DPI.
+    // Wait for that message before deriving Chromium's live base DPI and
+    // applying the target display's physical size like the other widgets.
     await new Promise((resolve) => setTimeout(resolve, 140))
-    syncDesktopOrganizerRendererScale(win)
+    await syncDesktopOrganizerRendererScale(win)
     await syncDesktopOrganizerNativeSurfaceSize(win)
     scheduleDesktopOrganizerScaleStabilization(win)
     await win.webContents.executeJavaScript(`new Promise((resolve) => {
@@ -4418,9 +4457,7 @@ const createDesktopWidgetWindow = (widget) => {
   }
 
   const initialDisplayId = desktopWidgetDisplayId(widget)
-  const initialRendererScale = widget.kind === 'organizer' && useIndividualOrganizerDesktopChildren
-    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
-    : Number(desktopDisplayById(initialDisplayId)?.scaleFactor) || 1
+  const initialRendererScale = Number(desktopDisplayById(initialDisplayId)?.scaleFactor) || 1
   const initialZoomFactor = 1
   const requestedBounds = desktopWidgetWindowBounds(widget)
   const primaryWorkArea = screen.getPrimaryDisplay().workArea
@@ -4501,6 +4538,14 @@ const createDesktopWidgetWindow = (widget) => {
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
       await attachDesktopWindow(win)
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
+      if (widget.kind === 'organizer' && win.desktopOrganizerChildAttached) {
+        // Finalize against the live child HWND immediately before reveal. This
+        // is the first point where both Explorer parenting and Chromium's
+        // renderer are guaranteed to exist, regardless of startup event order.
+        await syncDesktopOrganizerRendererScale(win)
+        await syncDesktopOrganizerNativeSurfaceSize(win)
+        scheduleDesktopOrganizerScaleStabilization(win)
+      }
       await revealDesktopWidgetFirstFrame(win)
       resolveDesktopReady(Boolean(win.desktopOrganizerChildAttached || widget.kind !== 'organizer'))
     } catch (error) {
@@ -4544,7 +4589,8 @@ const createDesktopWidgetWindow = (widget) => {
       const cursorDisplayId = String(cursorDisplay.id)
       if (cursorDisplayId !== win.desktopDisplayId) {
         win.desktopDisplayId = cursorDisplayId
-        syncDesktopOrganizerRendererScale(win)
+        void syncDesktopOrganizerRendererScale(win)
+        void syncDesktopOrganizerNativeSurfaceSize(win)
         scheduleDesktopOrganizerScaleStabilization(win, cursorDisplayId)
       }
     }
@@ -4829,7 +4875,7 @@ const runDesktopWidgetWindowRegression = () => {
               mixedDpiWindow,
               desktopWidgetWindowBounds(mixedDpiWidget),
             )
-            const expectedScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
+            const expectedScale = Number(display.scaleFactor) || 1
             if (
               desktopWidgetWindows.get(mixedDpiWidget.id) !== mixedDpiWindow
               || getWindowHandle(mixedDpiWindow) !== originalHandle
@@ -4941,9 +4987,11 @@ const runDesktopWidgetWindowRegression = () => {
         await normalizeDesktopOrganizerZOrder()
       }
       const physicalGesture = async (win, startPoint, endPoint, dragSteps = 30) => {
+        const nativeStartPoint = await desktopRendererPointToNativeClient(win, startPoint)
+        const nativeEndPoint = await desktopRendererPointToNativeClient(win, endPoint)
         const result = await runDesktopHostHelper(win, {
-          dragStartPoint: startPoint,
-          dragEndPoint: endPoint,
+          dragStartPoint: nativeStartPoint,
+          dragEndPoint: nativeEndPoint,
           dragSteps,
         })
         await new Promise((resolve) => setTimeout(resolve, 240))
@@ -5325,8 +5373,12 @@ const runDesktopWidgetWindowRegression = () => {
         y: 24,
       })
       try {
+        const openButtonNativePoint = await desktopRendererPointToNativeClient(
+          clickableOrganizerWindow,
+          openButtonPoint,
+        )
         const inputHealth = await runDesktopHostHelper(clickableOrganizerWindow, {
-          inputHealthPoint: openButtonPoint,
+          inputHealthPoint: openButtonNativePoint,
         })
         const inputHandles = /\bhit-hwnd=(\d+).*\bwindow-hwnd=(\d+)/.exec(inputHealth)
         if (
@@ -5344,7 +5396,7 @@ const runDesktopWidgetWindowRegression = () => {
         }
         const openCountBeforeForegroundClick = desktopWidgetTestOpenedPaths.length
         const directClickResult = await runDesktopHostHelper(clickableOrganizerWindow, {
-          directClickPoint: openButtonPoint,
+          directClickPoint: openButtonNativePoint,
           directClickCount: 1,
         })
         await new Promise((resolve) => setTimeout(resolve, 120))
@@ -5387,9 +5439,11 @@ const runDesktopWidgetWindowRegression = () => {
       }
 
       const rendererGesture = async (startPoint, endPoint) => {
+        const nativeStartPoint = await desktopRendererPointToNativeClient(clickableOrganizerWindow, startPoint)
+        const nativeEndPoint = await desktopRendererPointToNativeClient(clickableOrganizerWindow, endPoint)
         const result = await runDesktopHostHelper(clickableOrganizerWindow, {
-          directDragStartPoint: startPoint,
-          directDragEndPoint: endPoint,
+          directDragStartPoint: nativeStartPoint,
+          directDragEndPoint: nativeEndPoint,
           directDragSteps: 12,
         })
         await new Promise((resolve) => setTimeout(resolve, 180))
@@ -5832,6 +5886,13 @@ const runDesktopOrganizerPromotionRegression = () => {
       if (organizers.some((win) => !win.desktopOrganizerChildAttached)) {
         throw new Error('organizer promotion regression timed out waiting for desktop-child attachment')
       }
+      const readyResults = await Promise.all(organizers.map((win) => Promise.race([
+        win.desktopReadyPromise,
+        new Promise((resolve) => setTimeout(() => resolve(false), 10_000)),
+      ])))
+      if (readyResults.some((ready) => !ready)) {
+        throw new Error('organizer promotion regression timed out waiting for DPI-stable first frames')
+      }
       const organizerDisplayIds = new Set(organizers.map((win) => win.desktopDisplayId))
       const liveHostDisplayIds = new Set(liveDesktopOrganizerHostWindows().map((host) => host.desktopDisplayId))
       if (!useIndividualOrganizerDesktopChildren && (
@@ -5846,14 +5907,13 @@ const runDesktopOrganizerPromotionRegression = () => {
       for (const win of organizers) {
         const renderer = await inspectDesktopWidgetRendererGeometry(win)
         const display = desktopDisplayById(win.desktopDisplayId)
-        const expectedScale = useIndividualOrganizerDesktopChildren
-          ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
-          : display?.scaleFactor
+        const expectedScale = display?.scaleFactor
         if (!renderer || !display || Math.abs(renderer.devicePixelRatio - expectedScale) > 0.01) {
           throw new Error(`organizer renderer DPI does not match its display: ${JSON.stringify({
             widgetId: win.desktopWidgetId,
             displayId: win.desktopDisplayId,
             rendererDpr: renderer?.devicePixelRatio,
+            zoomFactor: win.webContents.getZoomFactor(),
             displayScale: display?.scaleFactor,
             expectedScale,
           })}`)
@@ -5902,10 +5962,15 @@ const runDesktopOrganizerPromotionRegression = () => {
           return rect ? { x: rect.left + 18, y: rect.top + rect.height / 2 } : null
         })()`)
         if (!nativeDragWidget || !nativeDragStart) throw new Error('native organizer drag fixture is incomplete')
+        const nativeDragStartPoint = await desktopRendererPointToNativeClient(nativeDragWindow, nativeDragStart)
+        const nativeDragEndPoint = await desktopRendererPointToNativeClient(nativeDragWindow, {
+          x: nativeDragStart.x + 34,
+          y: nativeDragStart.y + 22,
+        })
         const nativeDragBefore = { x: nativeDragWidget.x, y: nativeDragWidget.y }
         const nativeDragResult = await runDesktopHostHelper(nativeDragWindow, {
-          dragStartPoint: nativeDragStart,
-          dragEndPoint: { x: nativeDragStart.x + 34, y: nativeDragStart.y + 22 },
+          dragStartPoint: nativeDragStartPoint,
+          dragEndPoint: nativeDragEndPoint,
           dragSteps: 24,
         })
         await new Promise((resolve) => setTimeout(resolve, 700))
