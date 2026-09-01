@@ -17,9 +17,12 @@ const {
   storedDesktopShellVisibility,
 } = require('./desktop-shell-visibility-core.cjs')
 const {
+  captureWorkspaceLayoutProfile,
   remapWorkspaceLayout,
+  restoreWorkspaceLayoutProfile,
   snapshotSchemaVersion,
   validateSnapshotDocument,
+  workspaceLayoutSignature,
 } = require('./workspace-snapshot-core.cjs')
 
 // A packaged GUI app can outlive the terminal or redirected pipe that started
@@ -128,6 +131,7 @@ let workspaceState = null
 let desktopHostState = 'disabled'
 let desktopStatusMessage = '桌面组件尚未启用'
 let displayRefreshTimer = null
+let displayRefreshRevision = 0
 let desktopTopologySignature = ''
 let desktopPointerHitTestTimer = null
 let desktopOrganizerBandHealthTimer = null
@@ -283,6 +287,7 @@ const defaultWorkspace = () => ({
   version: 1,
   widgets: [],
   desktopLayout: null,
+  desktopLayoutProfiles: [],
   settings: {
     desktopEnabled: true,
     launchAtLogin: false,
@@ -1839,6 +1844,9 @@ const loadWorkspace = async () => {
       desktopLayout: parsed.desktopLayout && Array.isArray(parsed.desktopLayout.displays)
         ? parsed.desktopLayout
         : null,
+      desktopLayoutProfiles: Array.isArray(parsed.desktopLayoutProfiles)
+        ? parsed.desktopLayoutProfiles.slice(0, 12)
+        : [],
       settings: { ...defaultWorkspace().settings, ...(parsed.settings || {}) },
     }
   } catch {
@@ -2011,16 +2019,16 @@ const captureSnapshotDesktop = () => {
   }
 }
 
-const desktopLayoutSignature = (layout) => JSON.stringify(
-  (Array.isArray(layout?.displays) ? layout.displays : [])
-    .map((display) => ({
-      id: String(display.id),
-      primary: display.primary === true,
-      scaleFactor: Number(display.scaleFactor) || 1,
-      bounds: display.bounds,
-    }))
-    .sort((left, right) => left.id.localeCompare(right.id)),
-)
+const storeDesktopLayoutProfile = (profile) => {
+  if (!workspaceState || !profile?.signature || !profile?.desktopLayout?.displays?.length) return
+  const profiles = Array.isArray(workspaceState.desktopLayoutProfiles)
+    ? workspaceState.desktopLayoutProfiles
+    : []
+  workspaceState.desktopLayoutProfiles = [
+    { ...profile, updatedAt: new Date().toISOString() },
+    ...profiles.filter((candidate) => candidate?.signature !== profile.signature),
+  ].slice(0, 12)
+}
 
 const latestDifferentSnapshotDesktopLayout = async (currentLayout) => {
   let entries = []
@@ -2029,7 +2037,7 @@ const latestDifferentSnapshotDesktopLayout = async (currentLayout) => {
   } catch {
     return null
   }
-  const currentSignature = desktopLayoutSignature(currentLayout)
+  const currentSignature = workspaceLayoutSignature(currentLayout)
   const candidates = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith('.json') && !entry.name.endsWith('.tmp.json'))
     .sort((left, right) => right.name.localeCompare(left.name))
@@ -2040,7 +2048,7 @@ const latestDifferentSnapshotDesktopLayout = async (currentLayout) => {
         parsed?.desktop
         && Array.isArray(parsed.desktop.displays)
         && parsed.desktop.displays.length
-        && desktopLayoutSignature(parsed.desktop) !== currentSignature
+        && workspaceLayoutSignature(parsed.desktop) !== currentSignature
       ) return parsed.desktop
     } catch {}
   }
@@ -2059,15 +2067,29 @@ const remapWorkspaceForCurrentDesktop = async ({ useSnapshotFallback = false } =
   }
   const previousState = JSON.stringify(workspaceState)
   let remappedWidgets = 0
+  let restoredWidgets = 0
   if (sourceLayout?.displays?.length) {
+    if (workspaceState.desktopLayout?.displays?.length) {
+      storeDesktopLayoutProfile(captureWorkspaceLayoutProfile(workspaceState, sourceLayout))
+    }
     const remapped = remapWorkspaceLayout(workspaceState, sourceLayout.displays, currentLayout.displays)
     workspaceState = remapped.workspace
     remappedWidgets = remapped.remappedWidgets
+    const targetSignature = workspaceLayoutSignature(currentLayout)
+    const targetProfile = workspaceState.desktopLayoutProfiles
+      ?.find((profile) => profile?.signature === targetSignature)
+    if (targetProfile) {
+      const restored = restoreWorkspaceLayoutProfile(workspaceState, targetProfile)
+      workspaceState = restored.workspace
+      restoredWidgets = restored.restoredWidgets
+    }
   }
   workspaceState.desktopLayout = currentLayout
+  storeDesktopLayoutProfile(captureWorkspaceLayoutProfile(workspaceState, currentLayout))
   return {
     changed: JSON.stringify(workspaceState) !== previousState,
     remappedWidgets,
+    restoredWidgets,
     sourceLayout,
     currentLayout,
   }
@@ -2708,19 +2730,17 @@ const broadcastDesktopInfo = () => {
 }
 
 const scheduleDisplayRefresh = () => {
+  const revision = ++displayRefreshRevision
   if (displayRefreshTimer) clearTimeout(displayRefreshTimer)
-  const topologyChanged = runtimeDisplayTopologySignature() !== desktopTopologySignature
-  const hiddenForTopologyChange = topologyChanged ? workspaceDesktopOrganizerWindows() : []
-  if (topologyChanged) {
-    for (const win of hiddenForTopologyChange) win.setOpacity(0.01)
-  }
   displayRefreshTimer = setTimeout(async () => {
     try {
       displayRefreshTimer = null
       const settledSignature = await waitForStableDisplayTopology({ stableMs: 750, timeoutMs: 3_500 })
+      if (revision !== displayRefreshRevision) return
       const confirmedTopologyChange = settledSignature !== desktopTopologySignature
       if (confirmedTopologyChange) {
         const remapped = await remapWorkspaceForCurrentDesktop()
+        if (revision !== displayRefreshRevision) return
         if (remapped.changed) await persistWorkspace()
         desktopTopologySignature = settledSignature
       }
@@ -2761,12 +2781,6 @@ const scheduleDisplayRefresh = () => {
       if (workspaceState?.settings.desktopEnabled) await attachDesktopWindows()
     } catch (error) {
       console.error(`[desktop-host] display refresh failed: ${error.message}`)
-    } finally {
-      // A failed or superseded topology refresh must never leave previously
-      // healthy widgets effectively invisible.
-      for (const win of hiddenForTopologyChange) {
-        if (!win.isDestroyed() && !win.desktopAttachmentInFlight) win.setOpacity(1)
-      }
     }
   }, 850)
 }

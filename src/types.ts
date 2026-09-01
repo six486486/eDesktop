@@ -87,6 +87,15 @@ export interface WorkspaceState {
     virtualBounds: { x: number; y: number; width: number; height: number }
     displays: DesktopInfo['displays']
   } | null
+  desktopLayoutProfiles?: Array<{
+    signature: string
+    desktopLayout: {
+      virtualBounds: { x: number; y: number; width: number; height: number }
+      displays: DesktopInfo['displays']
+    }
+    widgetFrames: Array<Pick<DesktopWidget, 'id' | 'x' | 'y' | 'width' | 'height'>>
+    updatedAt?: string
+  }>
   settings: WorkspaceSettings
 }
 
