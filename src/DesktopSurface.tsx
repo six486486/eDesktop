@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -358,7 +359,14 @@ function OrganizerFileIcon({ file }: { file: DesktopFile }) {
 function OrganizerWidget({ widget }: { widget: DesktopWidget }) {
   const api = window.desktopAPI
   const data = widget.data as OrganizerWidgetData
-  const files = Array.isArray(data.files) ? data.files : []
+  // An entry restored to the desktop during the previous shutdown is only a
+  // pending membership record until startup has physically moved it back.
+  // Rendering it early makes one real desktop icon look like two files.
+  const files = useMemo(() => (
+    Array.isArray(data.files)
+      ? data.files.filter((file) => file.temporarilyRestoredOnExit !== true)
+      : []
+  ), [data.files])
   const [orderedFiles, setOrderedFiles] = useState(files)
   const [dropActive, setDropActive] = useState(false)
   const [draggingFilePath, setDraggingFilePath] = useState('')

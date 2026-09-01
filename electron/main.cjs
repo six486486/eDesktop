@@ -138,6 +138,7 @@ let restoreOnQuitPromise = null
 let quitAfterRestore = false
 let restoreGuardianProcess = null
 let restoreGuardianSessionPath = ''
+let organizerStorageReconcileRetryTimer = null
 let snapshotMutationTail = Promise.resolve()
 let snapshotRestoreInProgress = false
 let workspaceMutationTail = Promise.resolve()
@@ -964,6 +965,22 @@ const movePath = async (sourcePath, destinationPath, options = {}) => {
   if (options.notifyShell !== false) void notifyShellMove(sourcePath, destinationPath, isDirectory)
 }
 
+const movePathWithTransientRetry = async (sourcePath, destinationPath, options = {}) => {
+  const retryDelays = Array.isArray(options.retryDelays)
+    ? options.retryDelays
+    : [80, 180, 360, 720]
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await movePath(sourcePath, destinationPath, options)
+      return
+    } catch (error) {
+      const transient = ['EBUSY', 'EACCES', 'EPERM'].includes(error?.code)
+      if (!transient || attempt >= retryDelays.length || !fs.existsSync(sourcePath)) throw error
+      await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]))
+    }
+  }
+}
+
 const importOrganizerFiles = async (widgetId, filePaths) => {
   const sources = [...new Set(
     (Array.isArray(filePaths) ? filePaths : [])
@@ -1556,7 +1573,11 @@ const reconcileOrganizerStorage = async () => {
           let destinationPath = filePath
           if (!pathIsInside(storagePath, filePath)) {
             destinationPath = availableDestination(storagePath, filePath, stat.isDirectory())
-            await movePath(filePath, destinationPath, { notifyShell: false })
+            // Login applications and Explorer extensions can briefly open a
+            // desktop shortcut without delete sharing. A one-shot rename left
+            // the entry marked as collected while the real icon stayed on the
+            // desktop. Retry only transient sharing/access failures.
+            await movePathWithTransientRetry(filePath, destinationPath, { notifyShell: false })
             shellMoves.push({
               sourcePath: filePath,
               destinationPath,
@@ -1610,6 +1631,27 @@ const reconcileOrganizerStorage = async () => {
     )))
   }
   return changed
+}
+
+const hasPendingOrganizerStorageReconcile = () => Boolean(workspaceState?.widgets?.some((widget) => (
+  widget.kind === 'organizer'
+  && (Array.isArray(widget.data?.files) ? widget.data.files : [])
+    .some((file) => file?.temporarilyRestoredOnExit === true)
+)))
+
+const scheduleOrganizerStorageReconcileRetry = (attempt = 0) => {
+  if (capturePath || desktopHostTest || desktopTrayTest || !hasPendingOrganizerStorageReconcile()) return
+  const delays = [500, 1_500, 4_000, 10_000]
+  if (attempt >= delays.length) return
+  if (organizerStorageReconcileRetryTimer) clearTimeout(organizerStorageReconcileRetryTimer)
+  organizerStorageReconcileRetryTimer = setTimeout(() => {
+    organizerStorageReconcileRetryTimer = null
+    void enqueueWorkspaceMutation(() => reconcileOrganizerStorage())
+      .catch((error) => console.warn(`[organizer] startup reconcile retry failed: ${error.message}`))
+      .finally(() => {
+        if (hasPendingOrganizerStorageReconcile()) scheduleOrganizerStorageReconcileRetry(attempt + 1)
+      })
+  }, delays[attempt])
 }
 
 const loadWorkspace = async () => {
@@ -3671,20 +3713,19 @@ const physicalVirtualScreenBounds = () => {
   return { x: left, y: top, width: right - left, height: bottom - top }
 }
 
-const desktopOrganizerHostBounds = (display) => {
-  const physicalBounds = physicalScreenRect(display.workArea)
+const desktopOrganizerHostBounds = () => {
   const physicalVirtualBounds = physicalVirtualScreenBounds()
   return {
-    x: Math.round(physicalBounds.x - physicalVirtualBounds.x),
-    y: Math.round(physicalBounds.y - physicalVirtualBounds.y),
-    width: Math.max(1, Math.round(physicalBounds.width)),
-    height: Math.max(1, Math.round(physicalBounds.height)),
+    x: 0,
+    y: 0,
+    width: Math.max(1, Math.round(physicalVirtualBounds.width)),
+    height: Math.max(1, Math.round(physicalVirtualBounds.height)),
   }
 }
 
 const syncDesktopOrganizerHostBounds = async (host, display) => {
   if (!host || host.isDestroyed() || !display) return
-  const bounds = desktopOrganizerHostBounds(display)
+  const bounds = desktopOrganizerHostBounds()
   // SetParent changes this BaseWindow from the target monitor's DPI to
   // Explorer's DPI asynchronously. Wait for that transition, then place the
   // child in Explorer's physical client coordinates. Electron's setBounds()
@@ -3786,14 +3827,12 @@ const desktopWidgetNativeBounds = (win, screenBounds) => {
   }
 }
 
-const desktopWidgetPhysicalClientBounds = (win, screenBounds, targetDisplay = null) => {
-  const display = targetDisplay || desktopDisplayById(win?.desktopDisplayId)
-  if (!display) return screenBounds
+const desktopWidgetPhysicalClientBounds = (_win, screenBounds) => {
   const physicalBounds = physicalScreenRect(screenBounds)
-  const physicalDisplayBounds = physicalScreenRect(display.workArea)
+  const physicalVirtualBounds = physicalVirtualScreenBounds()
   return {
-    x: Math.round(physicalBounds.x - physicalDisplayBounds.x),
-    y: Math.round(physicalBounds.y - physicalDisplayBounds.y),
+    x: Math.round(physicalBounds.x - physicalVirtualBounds.x),
+    y: Math.round(physicalBounds.y - physicalVirtualBounds.y),
     width: Math.max(1, Math.round(physicalBounds.width)),
     height: Math.max(1, Math.round(physicalBounds.height)),
   }
@@ -3887,8 +3926,7 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
       ? workspaceState.widgets.filter((widget) => (
         widget.kind === 'organizer'
         && !widget.hidden
-        && desktopWidgetWindows.has(widget.id)
-        && desktopWidgetDisplayId(widget) === host.desktopDisplayId
+        && desktopWidgetWindows.get(widget.id)?.desktopDisplayId === host.desktopDisplayId
       ))
       : []
     const shape = organizers.flatMap((widget) => {
@@ -3900,7 +3938,7 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
       // the physical rectangle back to those input units exactly. Scaling the
       // original DIP delta by target/primary was only an approximation and
       // drifted when the organizer crossed displays or the primary changed.
-      const physicalBounds = desktopWidgetPhysicalClientBounds(null, bounds, display)
+      const physicalBounds = desktopWidgetPhysicalClientBounds(null, bounds)
       const width = Math.max(1, Math.round(physicalBounds.width / shapeUnitScale))
       const height = Math.max(1, Math.round(physicalBounds.height / shapeUnitScale))
       const offsetX = Math.round(physicalBounds.x / shapeUnitScale)
@@ -4053,8 +4091,25 @@ const syncDesktopWidgetWindowFrame = (win, widget) => {
   const displayChanged = win.desktopDisplayId !== nextDisplayId
   if (widget.kind === 'organizer' && displayChanged && win.desktopOrganizerChildAttached) {
     win.desktopPendingDisplayId = nextDisplayId
-    if (!win.desktopInteractionLocked) void transitionDesktopOrganizerToDisplay(win, nextDisplayId)
+    if (!win.desktopInteractionLocked) {
+      void transitionDesktopOrganizerToDisplay(win, nextDisplayId)
+      return
+    }
+    // Every per-DPI organizer host spans the complete physical virtual desktop.
+    // Keep the old-display child following the pointer while the gesture owns
+    // Chromium capture, then recreate it on the destination DPI after release.
+    // Previously this branch returned without moving, which visibly pinned the
+    // organizer to the monitor edge until pointer-up.
+    const nextBounds = desktopWidgetWindowBounds(widget)
+    win.desktopProgrammaticMoveUntil = Date.now() + 150
+    setDesktopWidgetWindowPosition(win, nextBounds.x, nextBounds.y)
+    win.desktopRequestedBounds = nextBounds
+    applyDesktopOrganizerHostShape(win.desktopDisplayId)
     return
+  }
+  if (widget.kind === 'organizer' && win.desktopInteractionLocked) {
+    // The pointer can cross a boundary and come back before release.
+    win.desktopPendingDisplayId = null
   }
   win.desktopDisplayId = nextDisplayId
   if (widget.kind === 'organizer') syncDesktopOrganizerRendererScale(win)
@@ -4624,7 +4679,42 @@ const runDesktopWidgetWindowRegression = () => {
         const virtualBounds = virtualScreenBounds()
         mixedDpiWidget.x = mixedDpiTargetDisplay.workArea.x - virtualBounds.x + 24
         mixedDpiWidget.y = mixedDpiTargetDisplay.workArea.y - virtualBounds.y + 40
+        const dragPreviewHandle = getWindowHandle(mixedDpiWindow)
+        // Keep the synthetic lock alive without injecting a real mouse-down;
+        // the health loop correctly releases locks when Windows reports every
+        // button up, which is covered separately below.
+        desktopOrganizerBandHealthInFlight = true
+        mixedDpiWindow.desktopInteractionLocked = true
+        mixedDpiWindow.desktopInteractionLockedAt = Date.now()
         syncDesktopWidgetWindowFrame(mixedDpiWindow, mixedDpiWidget)
+        const previewDeadline = Date.now() + 2_000
+        while (
+          (mixedDpiWindow.desktopNativeClientBoundsInFlight || mixedDpiWindow.desktopPendingNativeClientBounds)
+          && Date.now() < previewDeadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 30))
+        }
+        const previewMetrics = await desktopIconHelperRequest('window-geometries', {
+          hwnds: [dragPreviewHandle],
+        }, 1_200)
+        const previewMetric = Array.isArray(previewMetrics) ? previewMetrics[0] : previewMetrics
+        const expectedPreviewRect = physicalScreenRect(desktopWidgetWindowBounds(mixedDpiWidget))
+        const previewInvalid = (
+          desktopWidgetWindows.get(mixedDpiWidget.id) !== mixedDpiWindow
+          || getWindowHandle(mixedDpiWindow) !== dragPreviewHandle
+          || mixedDpiWindow.desktopPendingDisplayId !== String(mixedDpiTargetDisplay.id)
+          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'X')) - expectedPreviewRect.x) > 3
+          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'Y')) - expectedPreviewRect.y) > 3
+        )
+        desktopOrganizerBandHealthInFlight = false
+        if (previewInvalid) {
+          throw new Error(`mixed-DPI locked preview stopped at the source edge: ${JSON.stringify({
+            pendingDisplayId: mixedDpiWindow.desktopPendingDisplayId,
+            previewMetric,
+            expectedPreviewRect,
+          })}`)
+        }
+        finishDesktopWindowInteraction(mixedDpiWindow)
         mixedDpiWindow = await waitForMixedDpiWindow()
         if (!mixedDpiWindow || mixedDpiWindow.isDestroyed()) {
           throw new Error('mixed-DPI move did not recreate the organizer on its target display')
@@ -4688,7 +4778,7 @@ const runDesktopWidgetWindowRegression = () => {
         }
         await assertMixedDpiHostShape('restore')
         desktopWidgetGeometryRecoveryTokens.set(mixedDpiWidget.id, Symbol('mixed-dpi-regression-complete'))
-        console.log(`[desktop-geometry] mixed-DPI geometry + host-clip assertion passed: ${mixedDpiSourceScaleFactor} -> ${mixedDpiTargetScaleFactor} -> ${mixedDpiSourceScaleFactor}`)
+        console.log(`[desktop-geometry] mixed-DPI live-drag + geometry + host-clip assertion passed: ${mixedDpiSourceScaleFactor} -> ${mixedDpiTargetScaleFactor} -> ${mixedDpiSourceScaleFactor}`)
       } else {
         console.log('[desktop-geometry] mixed-DPI assertion skipped: no displays with different scale factors')
       }
@@ -6381,6 +6471,7 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
   }
   if (!capturePath && !desktopHostTest && !desktopTrayTest) {
     await reconcileOrganizerStorage()
+    scheduleOrganizerStorageReconcileRetry()
     startRestoreGuardian()
   }
   if (constrainWorkspaceWidgetFrames()) await persistWorkspace()
@@ -6894,6 +6985,13 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
           ) {
             throw new Error(`organizer temporary exit restore mismatch: ${JSON.stringify(temporaryRestoreResult)}`)
           }
+          await new Promise((resolve) => setTimeout(resolve, 80))
+          const pendingRenderedCount = await desktopWindows.get(organizerDisplay?.id)?.webContents.executeJavaScript(`[
+            ...document.querySelectorAll('.organizer-file-open strong')
+          ].filter((element) => element.textContent === 'desktop-item').length`)
+          if (pendingRenderedCount !== 0) {
+            throw new Error('temporarily restored desktop file was rendered as already collected')
+          }
           await reconcileOrganizerStorage()
           const reimportedAfterRestart = workspaceState.widgets
             .find((widget) => widget.id === organizer.id)
@@ -6907,11 +7005,18 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
           ) {
             throw new Error('organizer startup re-import mismatch')
           }
+          await new Promise((resolve) => setTimeout(resolve, 80))
+          const reimportedRenderedCount = await desktopWindows.get(organizerDisplay?.id)?.webContents.executeJavaScript(`[
+            ...document.querySelectorAll('.organizer-file-open strong')
+          ].filter((element) => element.textContent === 'desktop-item').length`)
+          if (reimportedRenderedCount !== 1) {
+            throw new Error('successfully re-imported desktop file was not rendered exactly once')
+          }
           const lifecycleCleanupResult = await restoreOrganizerFilesToOriginalLocations()
           if (lifecycleCleanupResult.restored !== 1 || !fs.existsSync(testSourcePath)) {
             throw new Error('organizer lifecycle cleanup mismatch')
           }
-          console.log('[desktop-geometry] organizer quit/restart lifecycle assertion passed: restored on quit + re-imported on restart')
+          console.log('[desktop-geometry] organizer quit/restart lifecycle assertion passed: pending hidden + re-imported once on restart')
 
           const transferTarget = createWidget('organizer')
           transferTarget.title = '跨盒转移目标'
@@ -7359,7 +7464,7 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
       }
       setTimeout(() => app.quit(), desktopDragTest
         ? 120_000
-        : (desktopWidgetWindowTest ? 20_000 : (desktopHostRegressionTest ? 9000 : 6500)))
+        : (desktopWidgetWindowTest ? 20_000 : (desktopHostRegressionTest ? 15_000 : 6500)))
     }
   } else {
     createDesktopWidgetWindows()
@@ -7376,6 +7481,7 @@ app.on('before-quit', (event) => {
   if (desktopPointerHitTestTimer) clearInterval(desktopPointerHitTestTimer)
   if (desktopOrganizerBandHealthTimer) clearInterval(desktopOrganizerBandHealthTimer)
   if (desktopWidgetGeometryHealthTimer) clearInterval(desktopWidgetGeometryHealthTimer)
+  if (organizerStorageReconcileRetryTimer) clearTimeout(organizerStorageReconcileRetryTimer)
   if (capturePath || desktopHostTest || desktopTrayTest || iconTest || workspaceSnapshotTest || quitAfterRestore) {
     stopDesktopIconHelper()
     return
