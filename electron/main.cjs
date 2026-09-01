@@ -3932,7 +3932,7 @@ const setDesktopWidgetWindowBounds = (win, screenBounds) => {
     queueDesktopOrganizerClientBounds(win, screenBounds)
     setTimeout(() => {
       if (!win.isDestroyed() && !win.desktopNativeClientBoundsInFlight && !win.desktopPendingNativeClientBounds) {
-        void syncDesktopOrganizerRenderChildBounds(win)
+        void syncDesktopOrganizerNativeSurfaceSize(win)
       }
     }, 80)
     return
@@ -4115,18 +4115,21 @@ const desktopWidgetDisplayId = (widget) => {
   return String(display.id)
 }
 
-const syncDesktopOrganizerRenderChildBounds = async (win) => {
+const syncDesktopOrganizerNativeSurfaceSize = async (win) => {
   if (!isOrganizerWidgetWindow(win) || win.isDestroyed() || !win.desktopOrganizerChildAttached) return false
   const widget = workspaceState?.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
-  const display = desktopDisplayById(win.desktopDisplayId)
-  if (!widget || !display) return false
+  if (!widget) return false
   const physical = desktopWidgetPhysicalClientBounds(win, desktopWidgetWindowBounds(widget))
-  const displayScale = Number(display.scaleFactor) || 1
   try {
-    await desktopIconHelperRequest('resize-render-child-for-dpi', {
+    // The outer HWND and render child both use physical client pixels. Commit
+    // their size together without moving the HWND. During WM_DPICHANGED Windows
+    // may suggest a new outer size while GetDpiForWindow can still describe the
+    // monitor the organizer just left; a direct physical commit avoids both
+    // the stale-DPI multiplier and pointer drift during a native caption drag.
+    await desktopIconHelperRequest('stabilize-window-client-size', {
       hwnd: getWindowHandle(win),
-      logicalWidth: Math.max(1, Math.round(physical.width / displayScale)),
-      logicalHeight: Math.max(1, Math.round(physical.height / displayScale)),
+      physicalWidth: physical.width,
+      physicalHeight: physical.height,
     }, 1_200)
     return true
   } catch (error) {
@@ -4150,7 +4153,7 @@ const syncDesktopOrganizerRendererScale = (win) => {
   const currentZoomFactor = Number(win.webContents.getZoomFactor()) || 1
   if (Math.abs(currentZoomFactor - zoomFactor) > 0.001) {
     win.webContents.setZoomFactor(zoomFactor)
-    void syncDesktopOrganizerRenderChildBounds(win)
+    void syncDesktopOrganizerNativeSurfaceSize(win)
   }
   win.desktopOrganizerZoomFactor = zoomFactor
   return zoomFactor
@@ -4170,7 +4173,7 @@ const scheduleDesktopOrganizerScaleStabilization = (win, displayId = win?.deskto
         / (Number(desktopDisplayById(expectedDisplayId)?.scaleFactor) || 1),
       )
       syncDesktopOrganizerRendererScale(win)
-      void syncDesktopOrganizerRenderChildBounds(win)
+      void syncDesktopOrganizerNativeSurfaceSize(win)
     }, delay)
   }
 }
@@ -4373,7 +4376,7 @@ const stabilizeAttachedDesktopOrganizerGeometry = async (win, widget) => {
     // first visible frame is already at the stable Explorer DPI.
     await new Promise((resolve) => setTimeout(resolve, 140))
     syncDesktopOrganizerRendererScale(win)
-    await syncDesktopOrganizerRenderChildBounds(win)
+    await syncDesktopOrganizerNativeSurfaceSize(win)
     scheduleDesktopOrganizerScaleStabilization(win)
     await win.webContents.executeJavaScript(`new Promise((resolve) => {
       window.dispatchEvent(new Event('resize'))
@@ -4836,6 +4839,8 @@ const runDesktopWidgetWindowRegression = () => {
               || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'Y')) - expectedScreen.y) > 3
               || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'ClientWidth')) - expectedClient.width) > 3
               || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'ClientHeight')) - expectedClient.height) > 3
+              || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'RenderWidth')) - expectedClient.width) > 3
+              || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'RenderHeight')) - expectedClient.height) > 3
               || Math.abs(Number(renderer?.devicePixelRatio) - expectedScale) > 0.01
               || Math.abs(Number(renderer?.widgetWidth) - mixedDpiWidget.width) > 1
               || Math.abs(Number(renderer?.widgetHeight) - mixedDpiWidget.height) > 1

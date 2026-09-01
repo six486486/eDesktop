@@ -658,27 +658,36 @@ public static class DesktopIconNative
         }
     }
 
-    public static DesktopWindowGeometryInfo ResizeRenderChildForDpi(string rawHandle, int logicalWidth, int logicalHeight)
+    public static DesktopWindowGeometryInfo StabilizeWindowClientSize(string rawHandle, int physicalWidth, int physicalHeight)
     {
         IntPtr previousContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         try
         {
             IntPtr handle = ParseWindowHandle(rawHandle);
-            IntPtr renderChild = handle == IntPtr.Zero ? IntPtr.Zero : FindRenderWidgetHost(handle);
+            if (handle == IntPtr.Zero || !IsWindow(handle)) return ReadWindowGeometry(handle);
+            int safeWidth = Math.Max(1, physicalWidth);
+            int safeHeight = Math.Max(1, physicalHeight);
+            SetWindowPos(
+                handle,
+                IntPtr.Zero,
+                0,
+                0,
+                safeWidth,
+                safeHeight,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+            );
+            IntPtr renderChild = FindRenderWidgetHost(handle);
             if (renderChild == IntPtr.Zero || !IsWindow(renderChild)) return ReadWindowGeometry(handle);
-            uint dpi = GetDpiForWindow(handle);
-            if (dpi == 0) dpi = 96;
-            int physicalWidth = Math.Max(1, (int)Math.Round(Math.Max(1, logicalWidth) * dpi / 96.0));
-            int physicalHeight = Math.Max(1, (int)Math.Round(Math.Max(1, logicalHeight) * dpi / 96.0));
             SetWindowPos(
                 renderChild,
                 IntPtr.Zero,
                 0,
                 0,
-                physicalWidth,
-                physicalHeight,
+                safeWidth,
+                safeHeight,
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
             );
+            RedrawWindow(handle, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
             return ReadWindowGeometry(handle);
         }
         finally
@@ -1365,11 +1374,11 @@ if ($Mode -eq 'server') {
           [int]$request.width,
           [int]$request.height
         )
-      } elseif ($request.command -eq 'resize-render-child-for-dpi') {
-        $result = [DesktopIconNative]::ResizeRenderChildForDpi(
+      } elseif ($request.command -eq 'stabilize-window-client-size') {
+        $result = [DesktopIconNative]::StabilizeWindowClientSize(
           [string]$request.hwnd,
-          [int]$request.logicalWidth,
-          [int]$request.logicalHeight
+          [int]$request.physicalWidth,
+          [int]$request.physicalHeight
         )
       } elseif ($request.command -eq 'shortcut-info') {
         $result = Get-ShortcutInfo ([string]$request.path) $shortcutShell
