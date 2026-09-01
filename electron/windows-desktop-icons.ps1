@@ -425,40 +425,44 @@ public static class DesktopIconNative
             reason = "organizer-host-missing";
             return false;
         }
-        int organizerHostStyle = GetWindowLong(organizerHost, GWL_STYLE);
-        int organizerHostExtendedStyle = GetWindowLong(organizerHost, GWL_EXSTYLE);
-        if (
-            GetParent(organizerHost) != iconHost
-            || (organizerHostStyle & WS_CHILD) == 0
-            || (organizerHostStyle & WS_POPUP) != 0
-        )
+        bool directDesktopChildren = organizerHost == iconHost;
+        if (!directDesktopChildren)
         {
-            reason = "organizer-host-parent-drift";
-            return false;
-        }
-        if ((organizerHostExtendedStyle & WS_EX_TRANSPARENT) != 0)
-        {
-            reason = "organizer-host-transparent";
-            return false;
-        }
-        IntPtr iconView = FindWindowEx(iconHost, IntPtr.Zero, "SHELLDLL_DefView", null);
-        if (iconView != IntPtr.Zero)
-        {
-            bool organizerHostSeen = false;
-            IntPtr desktopChild = GetWindow(iconHost, GW_CHILD);
-            while (desktopChild != IntPtr.Zero)
+            int organizerHostStyle = GetWindowLong(organizerHost, GWL_STYLE);
+            int organizerHostExtendedStyle = GetWindowLong(organizerHost, GWL_EXSTYLE);
+            if (
+                GetParent(organizerHost) != iconHost
+                || (organizerHostStyle & WS_CHILD) == 0
+                || (organizerHostStyle & WS_POPUP) != 0
+            )
             {
-                if (desktopChild == organizerHost) organizerHostSeen = true;
-                if (desktopChild == iconView)
+                reason = "organizer-host-parent-drift";
+                return false;
+            }
+            if ((organizerHostExtendedStyle & WS_EX_TRANSPARENT) != 0)
+            {
+                reason = "organizer-host-transparent";
+                return false;
+            }
+            IntPtr iconView = FindWindowEx(iconHost, IntPtr.Zero, "SHELLDLL_DefView", null);
+            if (iconView != IntPtr.Zero)
+            {
+                bool organizerHostSeen = false;
+                IntPtr desktopChild = GetWindow(iconHost, GW_CHILD);
+                while (desktopChild != IntPtr.Zero)
                 {
-                    if (!organizerHostSeen)
+                    if (desktopChild == organizerHost) organizerHostSeen = true;
+                    if (desktopChild == iconView)
                     {
-                        reason = "organizer-host-order-drift";
-                        return false;
+                        if (!organizerHostSeen)
+                        {
+                            reason = "organizer-host-order-drift";
+                            return false;
+                        }
+                        break;
                     }
-                    break;
+                    desktopChild = GetWindow(desktopChild, GW_HWNDNEXT);
                 }
-                desktopChild = GetWindow(desktopChild, GW_HWNDNEXT);
             }
         }
 
@@ -695,6 +699,8 @@ public static class DesktopIconNative
         }
 
         IntPtr iconHost = FindDesktopIconHost();
+        bool directDesktopChildren = organizerHost == IntPtr.Zero;
+        if (directDesktopChildren) organizerHost = iconHost;
         string reason;
         bool healthyBefore = OrganizerBandIsHealthy(iconHost, organizerHost, handles.ToArray(), out reason);
         bool repaired = false;
@@ -711,51 +717,50 @@ public static class DesktopIconNative
         )
         {
             bool repairOrganizerOrder = false;
-            RECT organizerHostRect;
-            bool hasOrganizerHostRect = GetWindowRect(organizerHost, out organizerHostRect);
-            POINT organizerHostOrigin = new POINT {
-                X = hasOrganizerHostRect ? organizerHostRect.Left : 0,
-                Y = hasOrganizerHostRect ? organizerHostRect.Top : 0,
-            };
-            if (hasOrganizerHostRect) ScreenToClient(iconHost, ref organizerHostOrigin);
-            int organizerHostStyle = GetWindowLong(organizerHost, GWL_STYLE);
-            int nextOrganizerHostStyle = (organizerHostStyle | WS_CHILD) & ~WS_POPUP;
-            int organizerHostExtendedStyle = GetWindowLong(organizerHost, GWL_EXSTYLE);
-            int nextOrganizerHostExtendedStyle = (organizerHostExtendedStyle | WS_EX_NOACTIVATE) & ~WS_EX_TRANSPARENT;
-            bool organizerHostStyleChanged = nextOrganizerHostStyle != organizerHostStyle
-                || nextOrganizerHostExtendedStyle != organizerHostExtendedStyle;
-            bool organizerHostParentChanged = GetParent(organizerHost) != iconHost;
-            bool organizerHostOrderChanged = String.Equals(reason, "organizer-host-order-drift", StringComparison.Ordinal);
-            if (nextOrganizerHostStyle != organizerHostStyle) {
-                SetWindowLong(organizerHost, GWL_STYLE, nextOrganizerHostStyle);
-            }
-            if (nextOrganizerHostExtendedStyle != organizerHostExtendedStyle) {
-                SetWindowLong(organizerHost, GWL_EXSTYLE, nextOrganizerHostExtendedStyle);
-            }
-            if (organizerHostParentChanged) SetParent(organizerHost, iconHost);
-            if (hasOrganizerHostRect && (organizerHostStyleChanged || organizerHostParentChanged || organizerHostOrderChanged))
+            if (!directDesktopChildren)
             {
-                SetWindowPos(
-                    organizerHost,
-                    HWND_TOP,
-                    organizerHostOrigin.X,
-                    organizerHostOrigin.Y,
-                    Math.Max(1, organizerHostRect.Right - organizerHostRect.Left),
-                    Math.Max(1, organizerHostRect.Bottom - organizerHostRect.Top),
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED
-                );
-            }
-            else if (organizerHostStyleChanged || organizerHostParentChanged || organizerHostOrderChanged)
-            {
-                SetWindowPos(
-                    organizerHost,
-                    HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
-                );
+                RECT organizerHostRect;
+                bool hasOrganizerHostRect = GetWindowRect(organizerHost, out organizerHostRect);
+                POINT organizerHostOrigin = new POINT {
+                    X = hasOrganizerHostRect ? organizerHostRect.Left : 0,
+                    Y = hasOrganizerHostRect ? organizerHostRect.Top : 0,
+                };
+                if (hasOrganizerHostRect) ScreenToClient(iconHost, ref organizerHostOrigin);
+                int organizerHostStyle = GetWindowLong(organizerHost, GWL_STYLE);
+                int nextOrganizerHostStyle = (organizerHostStyle | WS_CHILD) & ~WS_POPUP;
+                int organizerHostExtendedStyle = GetWindowLong(organizerHost, GWL_EXSTYLE);
+                int nextOrganizerHostExtendedStyle = (organizerHostExtendedStyle | WS_EX_NOACTIVATE) & ~WS_EX_TRANSPARENT;
+                bool organizerHostStyleChanged = nextOrganizerHostStyle != organizerHostStyle
+                    || nextOrganizerHostExtendedStyle != organizerHostExtendedStyle;
+                bool organizerHostParentChanged = GetParent(organizerHost) != iconHost;
+                bool organizerHostOrderChanged = String.Equals(reason, "organizer-host-order-drift", StringComparison.Ordinal);
+                if (nextOrganizerHostStyle != organizerHostStyle) SetWindowLong(organizerHost, GWL_STYLE, nextOrganizerHostStyle);
+                if (nextOrganizerHostExtendedStyle != organizerHostExtendedStyle) SetWindowLong(organizerHost, GWL_EXSTYLE, nextOrganizerHostExtendedStyle);
+                if (organizerHostParentChanged) SetParent(organizerHost, iconHost);
+                if (hasOrganizerHostRect && (organizerHostStyleChanged || organizerHostParentChanged || organizerHostOrderChanged))
+                {
+                    SetWindowPos(
+                        organizerHost,
+                        HWND_TOP,
+                        organizerHostOrigin.X,
+                        organizerHostOrigin.Y,
+                        Math.Max(1, organizerHostRect.Right - organizerHostRect.Left),
+                        Math.Max(1, organizerHostRect.Bottom - organizerHostRect.Top),
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED
+                    );
+                }
+                else if (organizerHostStyleChanged || organizerHostParentChanged || organizerHostOrderChanged)
+                {
+                    SetWindowPos(
+                        organizerHost,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                    );
+                }
             }
 
             foreach (IntPtr handle in handles)

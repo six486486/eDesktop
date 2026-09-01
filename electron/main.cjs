@@ -111,6 +111,11 @@ let desktopWindow = null
 const desktopOrganizerHostWindows = new Map()
 const desktopWindows = new Map()
 const desktopWidgetWindows = new Map()
+// Organizer windows are independent direct children of Explorer's desktop
+// host. They deliberately do not share an eDesktop parent window: a shared
+// per-display parent couples clipping, DPI and pointer coordinates and makes a
+// cross-monitor drag depend on two HWND hierarchies changing in sync.
+const useIndividualOrganizerDesktopChildren = true
 // Organizer DPI hand-offs are double buffered. Replacement windows live here
 // while their target-DPI Chromium surface is being prepared, but they do not
 // become the workspace window until that surface is complete.
@@ -2449,10 +2454,10 @@ const refreshDesktopOrganizerBandHealth = async () => {
     const displayIds = [...new Set(organizers.map((win) => win.desktopDisplayId))]
     for (const displayId of displayIds) {
       const displayOrganizers = organizers.filter((win) => win.desktopDisplayId === displayId)
-      const organizerHost = desktopOrganizerHostForDisplay(displayId)
-      if (!organizerHost) continue
       const result = await desktopIconHelperRequest('organizer-band-health', {
-        organizerHostHwnd: getWindowHandle(organizerHost),
+        organizerHostHwnd: useIndividualOrganizerDesktopChildren
+          ? '0'
+          : getWindowHandle(desktopOrganizerHostForDisplay(displayId)),
         hwnds: displayOrganizers.map(getWindowHandle),
       }, 1_200)
       results.push(result)
@@ -2469,7 +2474,8 @@ const refreshDesktopOrganizerBandHealth = async () => {
             || !win.desktopOrganizerLayerResult?.includes('placement=desktop-child')
           ) {
             win.desktopAttached = true
-            win.desktopOrganizerLayerResult = `recovered parent=${getWindowHandle(organizerHost)} placement=desktop-child no-activate=False`
+            const nativeParent = String(result?.OrganizerHost ?? result?.organizerHost ?? '')
+            win.desktopOrganizerLayerResult = `recovered parent=${nativeParent} icon-host=${nativeParent} placement=desktop-child no-activate=False`
             recoveredAttachmentMetadata = true
           }
         }
@@ -3125,12 +3131,10 @@ const lowerDesktopOrganizerWindow = async (win) => {
   ) return ''
   try {
     win.setAlwaysOnTop(false)
-    const organizerHost = await ensureDesktopOrganizerHostWindow(win.desktopDisplayId)
-    if (!organizerHost) throw new Error('收纳盒桌面宿主不可用')
     const hostResult = await runDesktopHostHelper(win, {
       noActivate: false,
       desktopChild: true,
-      parentWindow: organizerHost,
+      parentWindow: useIndividualOrganizerDesktopChildren ? null : desktopOrganizerHostForWindow(win),
     })
     win.desktopOrganizerLayerResult = hostResult
     win.desktopOrganizerChildAttached = hostResult.includes('placement=desktop-child')
@@ -3189,7 +3193,7 @@ const attachDesktopWindow = async (win) => {
   win.setAlwaysOnTop(false)
   const organizerWindow = isOrganizerWidgetWindow(win)
   try {
-    if (organizerWindow) {
+    if (organizerWindow && !useIndividualOrganizerDesktopChildren) {
       const organizerHost = await ensureDesktopOrganizerHostWindow(win.desktopDisplayId)
       if (!organizerHost) throw new Error('收纳盒桌面宿主不可用')
     }
@@ -3204,7 +3208,9 @@ const attachDesktopWindow = async (win) => {
     const hostResult = await runDesktopHostHelper(win, {
       noActivate: false,
       desktopChild: organizerWindow,
-      parentWindow: organizerWindow ? desktopOrganizerHostForWindow(win) : null,
+      parentWindow: organizerWindow && !useIndividualOrganizerDesktopChildren
+        ? desktopOrganizerHostForWindow(win)
+        : null,
     })
     const attached = Boolean(hostResult)
     win.showInactive()
@@ -3691,6 +3697,14 @@ const desktopOrganizerHostForDisplay = (displayId) => {
 
 const desktopOrganizerHostForWindow = (win) => desktopOrganizerHostForDisplay(win?.desktopDisplayId)
 
+const desktopOrganizerUsesDirectDesktopParent = (win) => (
+  /parent=(\d+).*icon-host=\1/.test(win?.desktopOrganizerLayerResult || '')
+)
+
+const desktopOrganizerNativeParentHandle = (win) => (
+  /parent=(\d+)/.exec(win?.desktopOrganizerLayerResult || '')?.[1] || ''
+)
+
 const physicalScreenRect = (rect) => {
   if (typeof screen.dipToScreenRect === 'function') {
     return screen.dipToScreenRect(null, rect)
@@ -3742,6 +3756,7 @@ const syncDesktopOrganizerHostBounds = async (host, display) => {
 }
 
 const ensureDesktopOrganizerHostWindow = async (displayId = String(screen.getPrimaryDisplay().id)) => {
+  if (useIndividualOrganizerDesktopChildren) return null
   if (!useDesktopWidgetWindows || !workspaceState?.settings.desktopEnabled) return null
   const normalizedDisplayId = String(displayId)
   const existing = desktopOrganizerHostForDisplay(normalizedDisplayId)
@@ -3802,6 +3817,7 @@ const ensureDesktopOrganizerHostWindow = async (displayId = String(screen.getPri
 }
 
 const ensureDesktopOrganizerHostWindows = async () => {
+  if (useIndividualOrganizerDesktopChildren) return []
   const displayIds = new Set((workspaceState?.widgets || [])
     .filter((widget) => widget.kind === 'organizer' && !widget.hidden)
     .map((widget) => desktopWidgetDisplayId(widget)))
@@ -3947,6 +3963,7 @@ const roundedDesktopOrganizerShape = (width, height) => {
 }
 
 const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
+  if (useIndividualOrganizerDesktopChildren) return
   const hosts = requestedDisplayId
     ? [desktopOrganizerHostForDisplay(requestedDisplayId)].filter(Boolean)
     : liveDesktopOrganizerHostWindows()
@@ -4033,6 +4050,14 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
 
 const rebuildDesktopOrganizerHosts = async () => {
   if (!useDesktopWidgetWindows || !workspaceState?.settings.desktopEnabled) return []
+  if (useIndividualOrganizerDesktopChildren) {
+    for (const win of desktopOrganizerTransitionWindows) {
+      if (!win.isDestroyed()) win.destroy()
+    }
+    desktopOrganizerTransitionWindows.clear()
+    syncDesktopWidgetWindows()
+    return []
+  }
   const oldHosts = liveDesktopOrganizerHostWindows()
   const organizerWindows = desktopOrganizerBandWindows()
   for (const win of organizerWindows) {
@@ -4105,7 +4130,9 @@ const recreateDesktopOrganizerWindow = async (win, widget, reason = 'geometry-re
     || widget?.kind !== 'organizer'
     || !workspaceState?.settings.desktopEnabled
   ) return null
-  await ensureDesktopOrganizerHostWindow(desktopWidgetDisplayId(widget))
+  if (!useIndividualOrganizerDesktopChildren) {
+    await ensureDesktopOrganizerHostWindow(desktopWidgetDisplayId(widget))
+  }
   desktopWidgetWindows.delete(widget.id)
   win.desktopGeometryReplacementReason = reason
   win.destroy()
@@ -4113,6 +4140,7 @@ const recreateDesktopOrganizerWindow = async (win, widget, reason = 'geometry-re
 }
 
 const prewarmDesktopOrganizerHost = async (displayId) => {
+  if (useIndividualOrganizerDesktopChildren) return null
   const normalizedDisplayId = String(displayId)
   const host = await ensureDesktopOrganizerHostWindow(normalizedDisplayId)
   const display = desktopDisplayById(normalizedDisplayId)
@@ -4168,8 +4196,10 @@ const prepareDesktopOrganizerTransition = (win, displayId) => {
     promise: null,
   }
   prepared.promise = (async () => {
-    await prewarmDesktopOrganizerHost(normalizedDisplayId)
-    prepared.hostPrewarmed = true
+    if (!useIndividualOrganizerDesktopChildren) {
+      await prewarmDesktopOrganizerHost(normalizedDisplayId)
+      prepared.hostPrewarmed = true
+    }
     if (prepared.cancelled || win.isDestroyed()) {
       prepared.hostPrewarmed = false
       releaseDesktopOrganizerHostPrewarm(normalizedDisplayId)
@@ -4603,6 +4633,7 @@ const createDesktopWidgetWindow = (widget, options = {}) => {
     widgetWindow: '1',
     widgetMargin: String(desktopWidgetWindowMargin),
     organizerRadius: String(desktopOrganizerVisualRadius),
+    nativeCursor: desktopWidgetWindowTest ? '0' : '1',
   })
   win.webContents.once('did-finish-load', async () => {
     if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
@@ -4626,6 +4657,9 @@ const createDesktopWidgetWindow = (widget, options = {}) => {
         win.setOpacity(0)
         win.setIgnoreMouseEvents(true)
         win.desktopPointerInteractive = false
+        if (useIndividualOrganizerDesktopChildren) {
+          await runDesktopHostHelper(win, { displaceOrganizerBand: true })
+        }
         win.desktopFirstFrameRevealed = false
       } else {
         await revealDesktopWidgetFirstFrame(win)
@@ -5018,6 +5052,12 @@ const runDesktopWidgetWindowRegression = () => {
           }
         }
         const assertMixedDpiHostShape = async (phase) => {
+          if (useIndividualOrganizerDesktopChildren) {
+            if (!/parent=(\d+).*icon-host=\1/.test(mixedDpiWindow.desktopOrganizerLayerResult || '')) {
+              throw new Error(`mixed-DPI ${phase} organizer is not an independent Explorer child`)
+            }
+            return
+          }
           const host = desktopOrganizerHostForWindow(mixedDpiWindow)
           if (!host) throw new Error(`mixed-DPI ${phase} host is missing`)
           const clientBounds = desktopWidgetPhysicalClientBounds(
@@ -5133,7 +5173,9 @@ const runDesktopWidgetWindowRegression = () => {
       if (
         !bottomOrganizerWindow.desktopOrganizerLayerResult?.includes('placement=desktop-child')
         || organizerWindows.some((win) => (
-          !win.desktopOrganizerLayerResult?.includes(`parent=${getWindowHandle(desktopOrganizerHostForWindow(win))}`)
+          !(useIndividualOrganizerDesktopChildren
+            ? desktopOrganizerUsesDirectDesktopParent(win)
+            : win.desktopOrganizerLayerResult?.includes(`parent=${getWindowHandle(desktopOrganizerHostForWindow(win))}`))
           || !win.desktopOrganizerLayerResult?.includes('no-activate=False')
         ))
       ) {
@@ -5400,9 +5442,14 @@ const runDesktopWidgetWindowRegression = () => {
       if (desktopOrganizerBandHealthInFlight) {
         throw new Error('organizer band health request did not settle before fault injection')
       }
-      const clickableOrganizerHost = desktopOrganizerHostForWindow(clickableOrganizerWindow)
-      if (!clickableOrganizerHost) throw new Error('organizer host was missing before band fault injection')
-      await runDesktopHostHelper(clickableOrganizerHost, { displaceOrganizerBand: true })
+      if (useIndividualOrganizerDesktopChildren) {
+        clickableOrganizerWindow.setIgnoreMouseEvents(true, { forward: true })
+        clickableOrganizerWindow.desktopPointerInteractive = true
+      } else {
+        const clickableOrganizerHost = desktopOrganizerHostForWindow(clickableOrganizerWindow)
+        if (!clickableOrganizerHost) throw new Error('organizer host was missing before band fault injection')
+        await runDesktopHostHelper(clickableOrganizerHost, { displaceOrganizerBand: true })
+      }
       const organizerBandRecovery = await refreshDesktopOrganizerBandHealth()
       startDesktopOrganizerBandHealth()
       clickableOrganizerWindow.webContents.sendInputEvent({
@@ -5454,7 +5501,9 @@ const runDesktopWidgetWindowRegression = () => {
         !(sharedBandRecovery?.HealthyAfter || sharedBandRecovery?.healthyAfter)
         || metadataDriftWindow.desktopAttached !== true
         || !metadataDriftWindow.desktopOrganizerLayerResult?.includes('placement=desktop-child')
-        || !metadataDriftWindow.desktopOrganizerLayerResult?.includes(`parent=${getWindowHandle(desktopOrganizerHostForWindow(metadataDriftWindow))}`)
+        || !(useIndividualOrganizerDesktopChildren
+          ? desktopOrganizerUsesDirectDesktopParent(metadataDriftWindow)
+          : metadataDriftWindow.desktopOrganizerLayerResult?.includes(`parent=${getWindowHandle(desktopOrganizerHostForWindow(metadataDriftWindow))}`))
         || !sharedBandInputStyle.includes('transparent=False')
       ) {
         throw new Error(`one organizer disabled shared band recovery: ${JSON.stringify({ sharedBandRecovery, sharedBandInputStyle })}`)
@@ -5967,7 +6016,9 @@ const runDesktopWidgetWindowRegression = () => {
       await new Promise((resolve) => setTimeout(resolve, 80))
       const focusedOrganizerStyle = await runDesktopHostHelper(clickedOrganizerWindow, { inspectOnly: true })
       if (
-        !focusedOrganizerStyle.includes(`parent=${getWindowHandle(desktopOrganizerHostForWindow(clickedOrganizerWindow))}`)
+        !focusedOrganizerStyle.includes(`parent=${useIndividualOrganizerDesktopChildren
+          ? desktopOrganizerNativeParentHandle(clickedOrganizerWindow)
+          : getWindowHandle(desktopOrganizerHostForWindow(clickedOrganizerWindow))}`)
         || !focusedOrganizerStyle.includes('no-activate=False')
       ) {
         throw new Error(`focused organizer left the desktop child hierarchy: ${focusedOrganizerStyle}`)
@@ -5986,7 +6037,9 @@ const runDesktopWidgetWindowRegression = () => {
         runDesktopHostHelper(win, { inspectOnly: true, compareWindow: focusedWidgetWindow })
       )))
       if (clickSequenceOrder.some((result, index) => (
-        !result.includes(`parent=${getWindowHandle(desktopOrganizerHostForWindow(organizerWindows[index]))}`)
+        !result.includes(`parent=${useIndividualOrganizerDesktopChildren
+          ? desktopOrganizerNativeParentHandle(organizerWindows[index])
+          : getWindowHandle(desktopOrganizerHostForWindow(organizerWindows[index]))}`)
         || !result.includes('no-activate=False')
         || !result.includes('transparent=False')
       ))) {
@@ -6048,10 +6101,10 @@ const runDesktopOrganizerPromotionRegression = () => {
       }
       const organizerDisplayIds = new Set(organizers.map((win) => win.desktopDisplayId))
       const liveHostDisplayIds = new Set(liveDesktopOrganizerHostWindows().map((host) => host.desktopDisplayId))
-      if (
+      if (!useIndividualOrganizerDesktopChildren && (
         organizerDisplayIds.size !== liveHostDisplayIds.size
         || [...organizerDisplayIds].some((displayId) => !liveHostDisplayIds.has(displayId))
-      ) {
+      )) {
         throw new Error(`per-display organizer hosts are incomplete: ${JSON.stringify({
           organizers: [...organizerDisplayIds],
           hosts: [...liveHostDisplayIds],
@@ -6070,7 +6123,14 @@ const runDesktopOrganizerPromotionRegression = () => {
         }
         const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
         const organizerHost = desktopOrganizerHostForWindow(win)
-        if (!widget || !organizerHost) throw new Error('organizer host-shape fixture is incomplete')
+        if (!widget) throw new Error('organizer desktop-child fixture is incomplete')
+        if (useIndividualOrganizerDesktopChildren) {
+          if (!desktopOrganizerUsesDirectDesktopParent(win)) {
+            throw new Error(`organizer is not an independent Explorer child: ${win.desktopOrganizerLayerResult}`)
+          }
+          continue
+        }
+        if (!organizerHost) throw new Error('organizer host-shape fixture is incomplete')
         const physicalClientBounds = desktopWidgetPhysicalClientBounds(win, desktopWidgetWindowBounds(widget))
         const hostShape = await runDesktopHostHelper(organizerHost, {
           shapePoint: {
@@ -6087,7 +6147,9 @@ const runDesktopOrganizerPromotionRegression = () => {
           })}`)
         }
       }
-      console.log(`[desktop-host] per-display host + mixed-DPI + native clip assertion passed: ${organizerDisplayIds.size} hosts`)
+      console.log(useIndividualOrganizerDesktopChildren
+        ? `[desktop-host] independent Explorer-child + mixed-DPI assertion passed: ${organizers.length} organizers`
+        : `[desktop-host] per-display host + mixed-DPI + native clip assertion passed: ${organizerDisplayIds.size} hosts`)
       for (const win of organizers) {
         const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
         if (widget) savedFrames.set(widget.id, { x: widget.x, y: widget.y, width: widget.width, height: widget.height })
@@ -6156,7 +6218,9 @@ const runDesktopOrganizerPromotionRegression = () => {
       // without restoring the stale JavaScript order or touching any sibling.
       topWindow.moveTop()
       const focusOrderHealth = await desktopIconHelperRequest('organizer-band-health', {
-        organizerHostHwnd: getWindowHandle(desktopOrganizerHostForWindow(topWindow)),
+        organizerHostHwnd: useIndividualOrganizerDesktopChildren
+          ? '0'
+          : getWindowHandle(desktopOrganizerHostForWindow(topWindow)),
         hwnds: desktopOrganizerBandWindows(topWindow.desktopDisplayId).map(getWindowHandle),
       }, 1_500)
       if (
@@ -6228,13 +6292,17 @@ const runDesktopOrganizerPromotionRegression = () => {
       const unrelatedResult = await runDesktopHostHelper(unrelatedHostChild, {
         noActivate: true,
         desktopChild: true,
-        parentWindow: desktopOrganizerHostForWindow(clickedWindow),
+        parentWindow: useIndividualOrganizerDesktopChildren
+          ? null
+          : desktopOrganizerHostForWindow(clickedWindow),
       })
       if (!unrelatedResult.includes('placement=desktop-child')) {
         throw new Error(`unrelated host child fixture did not attach: ${unrelatedResult}`)
       }
       const healthWithUnrelatedChild = await desktopIconHelperRequest('organizer-band-health', {
-        organizerHostHwnd: getWindowHandle(desktopOrganizerHostForWindow(clickedWindow)),
+        organizerHostHwnd: useIndividualOrganizerDesktopChildren
+          ? '0'
+          : getWindowHandle(desktopOrganizerHostForWindow(clickedWindow)),
         hwnds: desktopOrganizerBandWindows(clickedWindow.desktopDisplayId).map(getWindowHandle),
       }, 1_500)
       if (

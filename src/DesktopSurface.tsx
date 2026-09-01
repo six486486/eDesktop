@@ -155,6 +155,7 @@ function WidgetShell({
   children,
 }: WidgetShellProps) {
   const api = window.desktopAPI
+  const useNativeCursor = new URLSearchParams(window.location.search).get('nativeCursor') !== '0'
   const [frame, setFrame] = useState({ x: widget.x, y: widget.y, width: widget.width, height: widget.height })
   const [titleDraft, setTitleDraft] = useState(widget.title)
   const frameRef = useRef(frame)
@@ -175,6 +176,14 @@ function WidgetShell({
   }
 
   const desktopPointFromEvent = (pointerEvent: Pick<PointerEvent, 'screenX' | 'screenY' | 'clientX' | 'clientY'>) => {
+    if (widget.kind === 'organizer' && windowMargin !== undefined && api && useNativeCursor) {
+      // Chromium virtualizes PointerEvent.screenX when a child HWND crosses
+      // monitors with different scale factors. Windows' cursor position is
+      // already expressed in Electron's unified desktop DIPs and therefore
+      // stays aligned with the physical mouse throughout the gesture.
+      const cursor = api.getCursorPosition()
+      return cursor
+    }
     if (Number.isFinite(pointerEvent.screenX) && Number.isFinite(pointerEvent.screenY)) {
       return {
         x: pointerEvent.screenX - virtualBounds.x,
