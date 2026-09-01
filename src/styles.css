@@ -52,15 +52,7 @@
   font-family: 'Inter Tight', 'Microsoft YaHei UI', 'PingFang SC', sans-serif;
   font-synthesis: none;
   text-rendering: geometricPrecision;
-  --ink: #171817;
-  --muted: #70736f;
-  --line: #d8d8d2;
-  --canvas: #f1f0eb;
-  --panel: #faf9f5;
-  --paper: #f4f1e8;
-  --yellow: #f2c84b;
   --emerald: #176c5b;
-  --graphite: #282a29;
 }
 
 * {
@@ -2689,6 +2681,12 @@ button:disabled {
 
 .flip-digit {
   --flap-face-height: 48px;
+  --flap-top-face:
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.055)),
+    #124b3f;
+  --flap-bottom-face:
+    linear-gradient(to bottom, rgba(2, 27, 22, 0.08), rgba(2, 27, 22, 0.25)),
+    #124b3f;
   position: relative;
   display: block;
   width: 38px;
@@ -2728,31 +2726,6 @@ button:disabled {
   right: -2px;
 }
 
-.flip-digit-half {
-  position: absolute;
-  left: 2px;
-  z-index: 1;
-  display: block;
-  width: calc(100% - 4px);
-  height: 24px;
-  overflow: hidden;
-  background: rgba(12, 63, 53, 0.9);
-  backface-visibility: hidden;
-  transform-style: preserve-3d;
-}
-
-.flip-digit-top {
-  top: 2px;
-  border-radius: 4px 4px 1px 1px;
-  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.055));
-}
-
-.flip-digit-bottom {
-  bottom: 2px;
-  border-radius: 1px 1px 4px 4px;
-  background: linear-gradient(to bottom, rgba(2, 27, 22, 0.08), rgba(2, 27, 22, 0.25));
-}
-
 .flip-digit-glyph {
   position: absolute;
   left: 0;
@@ -2773,11 +2746,11 @@ button:disabled {
   content: attr(data-value);
 }
 
-.flip-digit-top .flip-digit-glyph {
+.flip-digit-face-top .flip-digit-glyph {
   top: 0;
 }
 
-.flip-digit-bottom .flip-digit-glyph {
+.flip-digit-face-bottom .flip-digit-glyph {
   bottom: 0;
 }
 
@@ -2820,33 +2793,32 @@ button:disabled {
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
   transform-style: preserve-3d;
-  will-change: transform, opacity;
+  will-change: transform;
+}
+
+.flip-digit-static-stage {
+  z-index: 1;
+}
+
+.flip-digit-face-top {
+  transform: rotateX(0deg);
+  transform-origin: center bottom;
+  background: var(--flap-top-face);
+}
+
+.flip-digit-face-bottom {
+  transform: rotateX(0deg);
+  transform-origin: center top;
+  background: var(--flap-bottom-face);
 }
 
 .flip-digit-leaf-out {
-  transform: rotateX(0deg);
-  transform-origin: center bottom;
-  background:
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.055)),
-    #124b3f;
   animation: split-flap-fold 220ms cubic-bezier(0.55, 0.05, 0.82, 0.42) both;
 }
 
 .flip-digit-leaf-in {
   transform: rotateX(89.9deg);
-  transform-origin: center top;
-  background:
-    linear-gradient(to bottom, rgba(2, 27, 22, 0.08), rgba(2, 27, 22, 0.25)),
-    #124b3f;
   animation: split-flap-unfold 240ms 220ms cubic-bezier(0.18, 0.58, 0.28, 1) both;
-}
-
-.flip-digit-leaf-out .flip-digit-glyph {
-  top: 0;
-}
-
-.flip-digit-leaf-in .flip-digit-glyph {
-  bottom: 0;
 }
 
 .flip-digit-leaf-out::after,
@@ -2920,28 +2892,18 @@ button:disabled {
 
 @keyframes split-flap-fold {
   0% {
-    opacity: 1;
     transform: rotateX(0deg);
   }
-  98% {
-    opacity: 1;
-  }
   100% {
-    opacity: 0;
     transform: rotateX(-89.9deg);
   }
 }
 
 @keyframes split-flap-unfold {
   0% {
-    opacity: 0;
     transform: rotateX(89.9deg);
   }
-  2% {
-    opacity: 1;
-  }
   100% {
-    opacity: 1;
     transform: rotateX(0deg);
   }
 }

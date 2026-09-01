@@ -361,6 +361,7 @@ public static class DesktopIconNative
     private const uint SHCNE_RENAMEFOLDER = 0x00020000;
     private const uint SHCNF_PATHW = 0x0005;
     private const uint SHCNF_FLUSH = 0x1000;
+    private const uint WM_SETREDRAW = 0x000B;
     private const uint WM_COMMAND = 0x0111;
     private const int FCIDM_SHVIEW_REFRESH = 0x7103;
     private const uint SHGFI_ICON = 0x00000100;
@@ -1142,12 +1143,31 @@ public static class DesktopIconNative
             {
                 List<DesktopIconInfo> items = ReadItems(listView, process, remoteItem, remoteText, remotePoint);
                 var hidden = new List<DesktopIconInfo>();
-                for (int index = items.Count - 1; index >= 0; index--)
+                var matchingIndices = new List<int>();
+                for (int index = 0; index < items.Count; index++)
                 {
-                    DesktopIconInfo item = items[index];
-                    if (!requestedNames.Contains(item.Name)) continue;
-                    if (SendDesktopMessage(listView, LVM_DELETEITEM, (IntPtr)index, IntPtr.Zero) == IntPtr.Zero) continue;
-                    hidden.Add(item);
+                    if (requestedNames.Contains(items[index].Name)) matchingIndices.Add(index);
+                }
+                if (matchingIndices.Count == 0) return hidden;
+
+                // LVM_DELETEITEM repaints the Explorer ListView after every message.
+                // Suppress those intermediate frames so a large collection becomes
+                // visible as one desktop update instead of a top-to-bottom cascade.
+                SendDesktopMessage(listView, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
+                try
+                {
+                    for (int match = matchingIndices.Count - 1; match >= 0; match--)
+                    {
+                        int index = matchingIndices[match];
+                        DesktopIconInfo item = items[index];
+                        if (SendDesktopMessage(listView, LVM_DELETEITEM, (IntPtr)index, IntPtr.Zero) == IntPtr.Zero) continue;
+                        hidden.Add(item);
+                    }
+                }
+                finally
+                {
+                    SendDesktopMessage(listView, WM_SETREDRAW, new IntPtr(1), IntPtr.Zero);
+                    RedrawWindow(listView, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
                 }
                 hidden.Reverse();
                 return hidden;

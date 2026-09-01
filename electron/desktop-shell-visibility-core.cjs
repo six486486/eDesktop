@@ -51,7 +51,6 @@ const desktopShellVisibilityEquals = (left, right) => {
 }
 
 module.exports = {
-  desktopShellVisibilityLocations,
   desktopShellVisibilityEquals,
   hiddenDesktopShellVisibility,
   normalizeDesktopShellVisibility,

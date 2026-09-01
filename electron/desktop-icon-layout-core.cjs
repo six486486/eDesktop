@@ -116,7 +116,6 @@ const restoreDesktopIconLayout = async ({
 
 module.exports = {
   createDesktopIconLayoutPlan,
-  defaultRetryAtMs,
   findDesktopIconPositionByNames,
   inspectDesktopIconLayout,
   restoreDesktopIconLayout,

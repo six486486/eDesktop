@@ -1,7 +1,7 @@
 {
   "name": "edesktop",
   "productName": "eDesktop",
-  "version": "0.1.56",
+  "version": "1.0.0",
   "private": true,
   "description": "Windows 10/11 桌面整理与效率工具",
   "author": "six486486",
@@ -36,6 +36,9 @@
     "test:restore-guardian": "node scripts/test-restore-guardian.cjs",
     "test:desktop-icon-layout": "node scripts/test-desktop-icon-layout.cjs",
     "test:desktop-shell-visibility": "node scripts/test-desktop-shell-visibility.cjs",
+    "test:pomodoro-flip": "node scripts/test-pomodoro-flip-continuity.cjs",
+    "test:pomodoro-timing": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/test-pomodoro-timing.mjs",
+    "test:widget-model": "node scripts/test-widget-model.cjs",
     "test:snapshots": "node scripts/test-workspace-snapshots.cjs",
     "test:snapshots:integration": "node scripts/test-workspace-snapshot-integration.cjs",
     "test:icon": "npm run generate:icon && node scripts/test-electron-icon.cjs",

@@ -176,7 +176,6 @@ export interface DesktopAPI {
   clearOrganizerFileSelection: (widgetId: string) => void
   onOrganizerFileSelectionCleared: (callback: () => void) => () => void
   openFile: (filePath: string) => Promise<string>
-  revealFile: (filePath: string) => Promise<void>
   getWorkspace: () => Promise<WorkspaceState>
   addWidget: (kind: WidgetKind) => Promise<DesktopWidget>
   updateWidget: (id: string, patch: Partial<DesktopWidget>) => Promise<WorkspaceState>
@@ -193,7 +192,6 @@ export interface DesktopAPI {
   setWorkspaceSnapshotSettings: (settings: { autoEnabled?: boolean; retention?: number }) => Promise<WorkspaceState>
   getDesktopStatus: () => Promise<DesktopStatus>
   setDesktopInteractionLocked: (locked: boolean) => void
-  showControlCenter: () => void
   onDesktopInfoChanged: (callback: (info: DesktopInfo) => void) => () => void
   onWorkspaceChanged: (callback: (state: WorkspaceState) => void) => () => void
   onDesktopStatusChanged: (callback: (status: DesktopStatus) => void) => () => void

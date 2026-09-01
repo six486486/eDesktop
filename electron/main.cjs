@@ -6,6 +6,7 @@ const path = require('node:path')
 const { promisify } = require('node:util')
 const { resolveWindowsLoginLauncherPath } = require('./login-item-path.cjs')
 const { installSafeConsole } = require('./safe-console.cjs')
+const { createWidget: createWidgetModel, safeWidgetPatch } = require('./widget-model.cjs')
 const {
   findDesktopIconPositionByNames,
   restoreDesktopIconLayout,
@@ -710,15 +711,15 @@ const suspendDesktopShellItemGuardFor = async (entries) => {
   return previousNames
 }
 
-const hideDesktopShellItemsFromView = async (descriptors) => {
-  const names = [...new Set(descriptors.flatMap((descriptor) => [...descriptor.names]))]
-  if (!names.length) return { hidden: [] }
-  const normalizedNames = new Set(names.map((name) => name.toLocaleLowerCase()))
+const hideDesktopItemsFromView = async (names) => {
+  const uniqueNames = [...new Set((names || []).filter((name) => typeof name === 'string' && name))]
+  if (!uniqueNames.length) return { hidden: [] }
+  const normalizedNames = new Set(uniqueNames.map((name) => name.toLocaleLowerCase()))
   let lastError = null
   for (const delayMs of [0, 80, 240, 700]) {
     if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs))
     try {
-      const result = await desktopIconHelperRequest('hide-items', { names }, 2_000)
+      const result = await desktopIconHelperRequest('hide-items', { names: uniqueNames }, 2_000)
       await new Promise((resolve) => setTimeout(resolve, 80))
       const currentItems = await desktopIconHelperRequest('list', {}, 2_000)
       const remaining = (Array.isArray(currentItems) ? currentItems : []).filter((item) => (
@@ -726,13 +727,13 @@ const hideDesktopShellItemsFromView = async (descriptors) => {
       ))
       if (result?.viewAvailable && !remaining.length) return result
       lastError = new Error(result?.viewAvailable
-        ? 'Windows 桌面仍保留系统图标'
+        ? 'Windows 桌面仍保留待隐藏图标'
         : 'Windows 桌面视图尚未就绪')
     } catch (error) {
       lastError = error
     }
   }
-  throw lastError || new Error('系统桌面图标实时隐藏失败')
+  throw lastError || new Error('桌面图标实时隐藏失败')
 }
 
 const verifyDesktopShellVisibilityStates = async (restorations) => {
@@ -771,7 +772,9 @@ const ensureDesktopShellItemsHidden = async (entries) => {
       ...previousGuardNames,
       ...descriptors.flatMap((descriptor) => [...descriptor.names]),
     ])
-    const liveResult = await hideDesktopShellItemsFromView(descriptors)
+    const liveResult = await hideDesktopItemsFromView(
+      descriptors.flatMap((descriptor) => [...descriptor.names]),
+    )
     await verifyDesktopShellVisibilityStates(descriptors.map(({ definition }) => ({
       definition,
       visibility: hiddenDesktopShellVisibility(),
@@ -988,8 +991,8 @@ const desktopIconNamesForPath = (filePath, isDirectory) => {
   ].filter(Boolean).map((name) => name.toLocaleLowerCase()))]
 }
 
-const desktopIconPositionSnapshot = async () => {
-  await refreshDesktopIconPositions(true)
+const desktopIconPositionSnapshot = async ({ refresh = true } = {}) => {
+  if (refresh) await refreshDesktopIconPositions(true)
   return [...desktopIconPositionCache.entries()].map(([name, position]) => ({
     names: [name],
     position: { ...position },
@@ -1706,6 +1709,81 @@ const persistOrganizerReconcileFileProgress = async (
   }
 }
 
+const uniqueDesktopItemNames = (names) => [...new Map((names || [])
+  .filter((name) => typeof name === 'string' && name)
+  .map((name) => [name.toLocaleLowerCase(), name]))
+  .values()]
+
+const organizerStartupDesktopHidePlan = (state) => {
+  const shellEntries = []
+  const desktopFileNames = []
+  const desktopFilePaths = []
+  for (const widget of state?.widgets?.filter((candidate) => candidate.kind === 'organizer') || []) {
+    for (const file of Array.isArray(widget.data?.files) ? widget.data.files : []) {
+      if (isOrganizerShellItem(file)) {
+        const definition = desktopShellItemDefinitionForClsid(file.shellClsid)
+        if (definition) shellEntries.push({ definition, name: file.name })
+        continue
+      }
+      if (file?.temporarilyRestoredOnExit !== true || typeof file.path !== 'string') continue
+      const filePath = path.resolve(file.path)
+      if (!fs.existsSync(filePath) || !pathIsDesktopItem(filePath)) continue
+      desktopFilePaths.push(filePath)
+      desktopFileNames.push(...desktopIconNamesForPath(filePath, Boolean(file.isDirectory)))
+    }
+  }
+  const shellDescriptors = desktopShellHideDescriptors(shellEntries)
+  const shellNames = uniqueDesktopItemNames(
+    shellDescriptors.flatMap((descriptor) => [...descriptor.names]),
+  )
+  return {
+    shellDescriptors,
+    shellNames,
+    desktopFileNames: uniqueDesktopItemNames(desktopFileNames),
+    desktopFilePaths,
+  }
+}
+
+const beginOrganizerStartupDesktopHide = async (plan) => {
+  const names = uniqueDesktopItemNames([...plan.shellNames, ...plan.desktopFileNames])
+  if (!names.length) return null
+  const previousGuardNames = [...desktopShellItemGuardNames]
+  const persistentGuardNames = uniqueDesktopItemNames([...previousGuardNames, ...plan.shellNames])
+  try {
+    // The guard command removes all requested ListView rows in one native call.
+    // Keep ordinary files guarded only while their physical moves are in flight,
+    // so Explorer cannot re-add them one by one as it observes the rename events.
+    await configureDesktopShellItemGuard([...persistentGuardNames, ...plan.desktopFileNames])
+    await Promise.all(plan.shellDescriptors.map(({ definition }) => (
+      setDesktopShellItemVisibility(definition.clsid, hiddenDesktopShellVisibility())
+    )))
+    await hideDesktopItemsFromView(names)
+    await verifyDesktopShellVisibilityStates(plan.shellDescriptors.map(({ definition }) => ({
+      definition,
+      visibility: hiddenDesktopShellVisibility(),
+    })))
+    return { ...plan, persistentGuardNames }
+  } catch (error) {
+    await configureDesktopShellItemGuard(previousGuardNames).catch(() => {})
+    throw error
+  }
+}
+
+const finishOrganizerStartupDesktopHide = async (activePlan) => {
+  if (!activePlan) return
+  await configureDesktopShellItemGuard(activePlan.persistentGuardNames)
+    .catch((error) => console.warn(`[organizer] startup desktop icon guard cleanup failed: ${error.message}`))
+  const hasUncollectedDesktopFile = activePlan.desktopFilePaths.some((filePath) => (
+    fs.existsSync(filePath) && pathIsDesktopItem(filePath)
+  ))
+  if (hasUncollectedDesktopFile) {
+    // A locked or otherwise failed item must become visible again after its
+    // temporary guard is removed. The saved layout is replayed immediately after.
+    await refreshDesktopView()
+      .catch((error) => console.warn(`[organizer] uncollected desktop icon refresh failed: ${error.message}`))
+  }
+}
+
 const reconcileOrganizerStorage = async () => {
   if (!workspaceState?.widgets) return false
   const iconProfileChanged = await captureCurrentDesktopIconLayoutProfile()
@@ -1725,132 +1803,144 @@ const reconcileOrganizerStorage = async () => {
       )
     )))
   const protectedDesktopPositions = hasDesktopReconcileMutations
-    ? await desktopIconPositionSnapshot().catch(() => [])
+    // captureCurrentDesktopIconLayoutProfile refreshed this cache immediately
+    // above. Reusing that coherent snapshot avoids a second Explorer round-trip
+    // on the startup path, which is noticeable with many organizer windows.
+    ? await desktopIconPositionSnapshot({ refresh: false }).catch(() => [])
     : []
   const removedDesktopIconNames = new Set()
-  const shellItemDefinitionsToHide = []
-  for (const widget of nextState.widgets.filter((candidate) => candidate.kind === 'organizer')) {
-    const storagePath = organizerStoragePath(widget.id)
-    await fs.promises.mkdir(storagePath, { recursive: true })
-    const files = Array.isArray(widget.data?.files) ? widget.data.files : []
-    const retainedFiles = []
-    for (const file of files) {
-      if (isOrganizerShellItem(file)) {
-        const definition = desktopShellItemDefinitionForClsid(file.shellClsid)
-        // A shell namespace item has no filesystem path, so unlike ordinary desktop
-        // files its saved position was never refreshed when a previous exit restored
-        // it. That left stale coordinates behind (for example Recycle Bin and a file
-        // both claiming the same grid cell), and Explorer displaced neighbouring icons
-        // during the next exit. Capture the currently visible shell item's position
-        // from the same coherent startup snapshot before hiding it again.
-        const currentDesktopPosition = desktopIconPositionForShellItem(file, definition)
-        for (const name of [file.name, ...(definition?.aliases || [])]) {
-          if (typeof name === 'string' && name) removedDesktopIconNames.add(name.toLocaleLowerCase())
-        }
-        if (definition) shellItemDefinitionsToHide.push({ definition, name: file.name })
-        const retainedShellItem = currentDesktopPosition
-          ? { ...file, originalDesktopPosition: currentDesktopPosition }
-          : file
-        if (file.temporarilyRestoredOnExit === true) {
-          const restoredFile = { ...retainedShellItem }
-          delete restoredFile.temporarilyRestoredOnExit
-          retainedFiles.push(restoredFile)
-          changed = true
-        } else {
-          retainedFiles.push(retainedShellItem)
-          if (currentDesktopPosition && (
-            currentDesktopPosition.x !== file.originalDesktopPosition?.x
-            || currentDesktopPosition.y !== file.originalDesktopPosition?.y
-          )) changed = true
-        }
-        continue
-      }
-      const filePath = path.resolve(file.path)
-      if (file.temporarilyRestoredOnExit === true) {
-        if (!fs.existsSync(filePath)) {
-          changed = true
+  const startupDesktopHide = await beginOrganizerStartupDesktopHide(
+    organizerStartupDesktopHidePlan(nextState),
+  )
+  try {
+    for (const widget of nextState.widgets.filter((candidate) => candidate.kind === 'organizer')) {
+      let widgetProgressChanged = false
+      const storagePath = organizerStoragePath(widget.id)
+      await fs.promises.mkdir(storagePath, { recursive: true })
+      const files = Array.isArray(widget.data?.files) ? widget.data.files : []
+      const retainedFiles = []
+      for (const file of files) {
+        if (isOrganizerShellItem(file)) {
+          const definition = desktopShellItemDefinitionForClsid(file.shellClsid)
+          // A shell namespace item has no filesystem path, so unlike ordinary desktop
+          // files its saved position was never refreshed when a previous exit restored
+          // it. That left stale coordinates behind (for example Recycle Bin and a file
+          // both claiming the same grid cell), and Explorer displaced neighbouring icons
+          // during the next exit. Capture the currently visible shell item's position
+          // from the same coherent startup snapshot before hiding it again.
+          const currentDesktopPosition = desktopIconPositionForShellItem(file, definition)
+          for (const name of [file.name, ...(definition?.aliases || [])]) {
+            if (typeof name === 'string' && name) removedDesktopIconNames.add(name.toLocaleLowerCase())
+          }
+          const retainedShellItem = currentDesktopPosition
+            ? { ...file, originalDesktopPosition: currentDesktopPosition }
+            : file
+          if (file.temporarilyRestoredOnExit === true) {
+            const restoredFile = { ...retainedShellItem }
+            delete restoredFile.temporarilyRestoredOnExit
+            retainedFiles.push(restoredFile)
+            changed = true
+          } else {
+            retainedFiles.push(retainedShellItem)
+            if (currentDesktopPosition && (
+              currentDesktopPosition.x !== file.originalDesktopPosition?.x
+              || currentDesktopPosition.y !== file.originalDesktopPosition?.y
+            )) changed = true
+          }
           continue
         }
-        try {
-          const stat = await fs.promises.lstat(filePath)
-          const currentDesktopPosition = pathIsDesktopItem(filePath)
-            ? desktopIconPositionForPath(filePath, stat.isDirectory())
-            : null
-          if (pathIsDesktopItem(filePath)) {
-            for (const name of desktopIconNamesForPath(filePath, stat.isDirectory())) {
-              removedDesktopIconNames.add(name)
+        const filePath = path.resolve(file.path)
+        if (file.temporarilyRestoredOnExit === true) {
+          if (!fs.existsSync(filePath)) {
+            changed = true
+            continue
+          }
+          try {
+            const stat = await fs.promises.lstat(filePath)
+            const wasDesktopItem = pathIsDesktopItem(filePath)
+            const currentDesktopPosition = wasDesktopItem
+              ? desktopIconPositionForPath(filePath, stat.isDirectory())
+              : null
+            let destinationPath = filePath
+            if (!pathIsInside(storagePath, filePath)) {
+              destinationPath = availableDestination(storagePath, filePath, stat.isDirectory())
+              // Login applications and Explorer extensions can briefly open a
+              // desktop shortcut without delete sharing. A one-shot rename left
+              // the entry marked as collected while the real icon stayed on the
+              // desktop. Retry only transient sharing/access failures.
+              await movePathWithTransientRetry(filePath, destinationPath, { notifyShell: false })
+              shellMoves.push({
+                sourcePath: filePath,
+                destinationPath,
+                isDirectory: stat.isDirectory(),
+              })
             }
+            const described = await describePath(destinationPath)
+            if (!described) throw new Error('重新收纳后无法读取文件')
+            const restoredFile = {
+              ...file,
+              ...described,
+              originalPath: file.originalPath || filePath,
+              originalDesktopPosition: currentDesktopPosition || file.originalDesktopPosition || null,
+            }
+            delete restoredFile.temporarilyRestoredOnExit
+            await persistOrganizerReconcileFileProgress(
+              widget.id,
+              file.id,
+              restoredFile,
+              destinationPath !== filePath
+                ? () => movePath(destinationPath, filePath, { notifyShell: false })
+                : null,
+            )
+            if (wasDesktopItem) {
+              for (const name of desktopIconNamesForPath(filePath, stat.isDirectory())) {
+                removedDesktopIconNames.add(name)
+              }
+            }
+            widgetProgressChanged = true
+            retainedFiles.push(restoredFile)
+            changed = true
+          } catch (error) {
+            retainedFiles.push(file)
+            console.warn(`[organizer] startup re-import failed for ${file.name || path.basename(filePath)}: ${error.message}`)
           }
-          let destinationPath = filePath
-          if (!pathIsInside(storagePath, filePath)) {
-            destinationPath = availableDestination(storagePath, filePath, stat.isDirectory())
-            // Login applications and Explorer extensions can briefly open a
-            // desktop shortcut without delete sharing. A one-shot rename left
-            // the entry marked as collected while the real icon stayed on the
-            // desktop. Retry only transient sharing/access failures.
-            await movePathWithTransientRetry(filePath, destinationPath, { notifyShell: false })
-            shellMoves.push({
-              sourcePath: filePath,
-              destinationPath,
-              isDirectory: stat.isDirectory(),
-            })
-          }
-          const described = await describePath(destinationPath)
-          if (!described) throw new Error('重新收纳后无法读取文件')
-          const restoredFile = {
-            ...file,
-            ...described,
-            originalPath: file.originalPath || filePath,
-            originalDesktopPosition: currentDesktopPosition || file.originalDesktopPosition || null,
-          }
-          delete restoredFile.temporarilyRestoredOnExit
-          await persistOrganizerReconcileFileProgress(
-            widget.id,
-            file.id,
-            restoredFile,
-            destinationPath !== filePath
-              ? () => movePath(destinationPath, filePath, { notifyShell: false })
-              : null,
-          )
-          retainedFiles.push(restoredFile)
-          changed = true
-        } catch (error) {
-          retainedFiles.push(file)
-          console.warn(`[organizer] startup re-import failed for ${file.name || path.basename(filePath)}: ${error.message}`)
+          continue
         }
-        continue
+        const retained = fs.existsSync(filePath) && pathIsInside(storagePath, filePath)
+        if (!retained) changed = true
+        if (retained) retainedFiles.push(file)
       }
-      const retained = fs.existsSync(filePath) && pathIsInside(storagePath, filePath)
-      if (!retained) changed = true
-      if (retained) retainedFiles.push(file)
+      const trackedPaths = new Set(retainedFiles
+        .filter((file) => !isOrganizerShellItem(file))
+        .map((file) => path.resolve(file.path).toLocaleLowerCase()))
+      const storageEntries = await fs.promises.readdir(storagePath, { withFileTypes: true })
+      for (const entry of storageEntries) {
+        const entryPath = path.join(storagePath, entry.name)
+        if (trackedPaths.has(path.resolve(entryPath).toLocaleLowerCase())) continue
+        const described = await describePath(entryPath)
+        if (!described) continue
+        retainedFiles.push({
+          ...described,
+          originalPath: path.join(organizerReleaseRoot(), entry.name),
+          originalDesktopPosition: null,
+        })
+        changed = true
+      }
+      widget.data = { ...widget.data, files: retainedFiles }
+      // Each moved item is already crash-safely persisted above. Publish once per
+      // organizer so completed boxes populate progressively without the cost of a
+      // workspace broadcast for every individual file.
+      if (widgetProgressChanged) broadcastWorkspace()
     }
-    const trackedPaths = new Set(retainedFiles
-      .filter((file) => !isOrganizerShellItem(file))
-      .map((file) => path.resolve(file.path).toLocaleLowerCase()))
-    const storageEntries = await fs.promises.readdir(storagePath, { withFileTypes: true })
-    for (const entry of storageEntries) {
-      const entryPath = path.join(storagePath, entry.name)
-      if (trackedPaths.has(path.resolve(entryPath).toLocaleLowerCase())) continue
-      const described = await describePath(entryPath)
-      if (!described) continue
-      retainedFiles.push({
-        ...described,
-        originalPath: path.join(organizerReleaseRoot(), entry.name),
-        originalDesktopPosition: null,
-      })
-      changed = true
+    if (shellMoves.length) await notifyShellMoves(shellMoves, { flush: true })
+    if (changed) await updateWorkspace(nextState)
+  } finally {
+    await finishOrganizerStartupDesktopHide(startupDesktopHide)
+    if (protectedDesktopPositions.length) {
+      await restoreDesktopIconPositions(protectedDesktopPositions.filter((entry) => (
+        !(entry.names || []).some((name) => removedDesktopIconNames.has(String(name).toLocaleLowerCase()))
+      )))
     }
-    widget.data = { ...widget.data, files: retainedFiles }
-  }
-  if (shellItemDefinitionsToHide.length) {
-    await ensureDesktopShellItemsHidden(shellItemDefinitionsToHide)
-  }
-  if (shellMoves.length) await notifyShellMoves(shellMoves, { flush: true })
-  if (changed) await updateWorkspace(nextState)
-  if (protectedDesktopPositions.length) {
-    await restoreDesktopIconPositions(protectedDesktopPositions.filter((entry) => (
-      !(entry.names || []).some((name) => removedDesktopIconNames.has(String(name).toLocaleLowerCase()))
-    )))
   }
   return changed
 }
@@ -1861,9 +1951,11 @@ const hasPendingOrganizerStorageReconcile = () => Boolean(workspaceState?.widget
     .some((file) => file?.temporarilyRestoredOnExit === true)
 )))
 
-const scheduleOrganizerStorageReconcileRetry = (attempt = 0) => {
+const scheduleOrganizerStorageReconcileRetry = (attempt = 0, surfacePoll = 0) => {
   if (capturePath || desktopHostTest || desktopTrayTest || !workspaceState?.settings.desktopEnabled) return
   const delays = [0, 500, 1_500, 4_000, 10_000, 20_000]
+  const surfacePollInterval = 100
+  const surfacePollLimit = 80
   if (attempt >= delays.length) return
   if (organizerStorageReconcileRetryTimer) clearTimeout(organizerStorageReconcileRetryTimer)
   organizerStorageReconcileRetryTimer = setTimeout(async () => {
@@ -1881,9 +1973,21 @@ const scheduleOrganizerStorageReconcileRetry = (attempt = 0) => {
       )
     })
     if (!surfacesReady) {
-      await attachMissingDesktopWindows().catch(() => [])
-      console.warn(`[organizer] startup collection deferred until all ${expectedVisibleWidgets.length} component surfaces are visible`)
-      scheduleOrganizerStorageReconcileRetry(attempt + 1)
+      // Native organizer attachment is asynchronous and commonly finishes just
+      // after the old 500ms checkpoint. Poll readiness cheaply instead of
+      // consuming the storage-failure backoff and sleeping another 1.5s.
+      if (surfacePoll === 0 || surfacePoll % 5 === 0) {
+        await attachMissingDesktopWindows().catch(() => [])
+      }
+      if (surfacePoll === 0) {
+        console.warn(`[organizer] startup collection waiting for all ${expectedVisibleWidgets.length} component surfaces`)
+      }
+      if (surfacePoll < surfacePollLimit) {
+        scheduleOrganizerStorageReconcileRetry(attempt, surfacePoll + 1)
+      } else {
+        console.warn('[organizer] startup component readiness polling timed out; switching to storage retry backoff')
+        scheduleOrganizerStorageReconcileRetry(attempt + 1)
+      }
       return
     }
     let failed = false
@@ -1895,7 +1999,7 @@ const scheduleOrganizerStorageReconcileRetry = (attempt = 0) => {
     if (failed || hasPendingOrganizerStorageReconcile()) {
       scheduleOrganizerStorageReconcileRetry(attempt + 1)
     }
-  }, delays[attempt])
+  }, surfacePoll > 0 ? surfacePollInterval : delays[attempt])
 }
 
 const recoverWorkspaceMetadataFromSnapshots = async (workspace) => {
@@ -3736,6 +3840,13 @@ const attachDesktopWindow = async (win) => {
       const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
       if (widget) {
         syncDesktopWidgetWindowFrame(win, widget)
+        // The expensive DPI stabilization and startup storage reconciliation do
+        // not need to block the organizer shell. Reveal its prepared renderer as
+        // soon as Explorer owns the child HWND; pending files remain filtered in
+        // React until their filesystem moves are safely persisted.
+        if (win.desktopOrganizerChildAttached && !win.desktopFirstFrameRevealed) {
+          await revealDesktopWidgetFirstFrame(win)
+        }
         await stabilizeAttachedDesktopOrganizerGeometry(win, widget)
       }
       applyDesktopOrganizerBand()
@@ -3943,55 +4054,11 @@ const requestControlWindowClose = () => {
   controlWindow.webContents.send('window:close-requested')
 }
 
-const widgetDefaults = {
-  organizer: { title: '新收纳盒', tone: 'paper', width: 360, height: 260, data: { files: [] } },
-  note: {
-    title: '新便签',
-    tone: 'yellow',
-    width: 280,
-    height: 220,
-    data: { content: '', updatedAt: new Date().toISOString() },
-  },
-  todo: {
-    title: '待办列表',
-    tone: 'paper',
-    width: 320,
-    height: 300,
-    data: { items: [], activeList: 'my-day' },
-  },
-  pomodoro: {
-    title: '番茄钟',
-    tone: 'emerald',
-    width: 280,
-    height: 300,
-    data: {
-      mode: 'focus',
-      focusMinutes: 25,
-      breakMinutes: 5,
-      remainingSeconds: 25 * 60,
-      running: false,
-      endsAt: null,
-      sessions: 0,
-    },
-  },
-}
-
 const createWidget = (kind) => {
-  const defaults = widgetDefaults[kind] || widgetDefaults.note
-  const index = workspaceState.widgets.length
-  const primaryOffset = primaryScreenOffset()
-  return {
-    id: crypto.randomUUID(),
-    kind: widgetDefaults[kind] ? kind : 'note',
-    title: defaults.title,
-    tone: defaults.tone,
-    x: primaryOffset.x + 48 + (index % 5) * 34,
-    y: primaryOffset.y + 96 + (index % 4) * 32,
-    width: defaults.width,
-    height: defaults.height,
-    hidden: false,
-    data: JSON.parse(JSON.stringify(defaults.data)),
-  }
+  return createWidgetModel(kind, {
+    index: workspaceState.widgets.length,
+    primaryOffset: primaryScreenOffset(),
+  })
 }
 
 const createCaptureWidgets = () => {
@@ -4072,20 +4139,6 @@ const createCaptureWidgets = () => {
   pomodoro.y = primaryOffset.y + 150
   workspaceState.widgets = original
   return [organizer, note, todo, pomodoro]
-}
-
-const safeWidgetPatch = (patch) => {
-  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return {}
-  const safe = {}
-  for (const key of ['title', 'tone', 'x', 'y', 'width', 'height', 'hidden', 'data']) {
-    if (Object.prototype.hasOwnProperty.call(patch, key)) safe[key] = patch[key]
-  }
-  if (typeof safe.title === 'string') safe.title = safe.title.slice(0, 80)
-  if (Number.isFinite(safe.x)) safe.x = Math.round(safe.x)
-  if (Number.isFinite(safe.y)) safe.y = Math.round(safe.y)
-  if (Number.isFinite(safe.width)) safe.width = Math.max(1, Math.min(900, Math.round(safe.width)))
-  if (Number.isFinite(safe.height)) safe.height = Math.max(1, Math.min(760, Math.round(safe.height)))
-  return safe
 }
 
 const loadSurface = (win, surface, extraQuery = {}) => {
@@ -5117,14 +5170,9 @@ const createDesktopWidgetWindow = (widget) => {
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
       await attachDesktopWindow(win)
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
-      if (widget.kind === 'organizer' && win.desktopOrganizerChildAttached) {
-        // Finalize against the live child HWND immediately before reveal. This
-        // is the first point where both Explorer parenting and Chromium's
-        // renderer are guaranteed to exist, regardless of startup event order.
-        await reconcileDesktopOrganizerDisplayFrame(win, win.desktopDisplayId)
-        scheduleDesktopOrganizerScaleStabilization(win)
+      if (!win.desktopFirstFrameRevealed) {
+        await revealDesktopWidgetFirstFrame(win)
       }
-      await revealDesktopWidgetFirstFrame(win)
       resolveDesktopReady(Boolean(win.desktopOrganizerChildAttached || widget.kind !== 'organizer'))
     } catch (error) {
       if (!win.isDestroyed()) {
@@ -7061,9 +7109,6 @@ const registerIpc = () => {
   ipcMain.handle('files:open', (_event, filePath) => (
     openDesktopFile(filePath, BrowserWindow.fromWebContents(_event.sender))
   ))
-  ipcMain.handle('files:reveal', (_event, filePath) => {
-    if (typeof filePath === 'string' && fs.existsSync(filePath)) shell.showItemInFolder(filePath)
-  })
   ipcMain.handle('organizer:prepare-import', async () => {
     try {
       await refreshDesktopIconPositions(true)
@@ -7325,7 +7370,6 @@ const registerIpc = () => {
     refreshDesktopPointerHitTest()
   })
 
-  ipcMain.on('window:show-control', showControlCenter)
   ipcMain.on('window:minimize', (event) => BrowserWindow.fromWebContents(event.sender)?.minimize())
   ipcMain.on('window:toggle-maximize', (event) => {
     const win = BrowserWindow.fromWebContents(event.sender)
@@ -7789,10 +7833,45 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
               if (upperLeaf && lowerLeaf) {
                 const upperStage = upperLeaf.parentElement
                 const lowerStage = lowerLeaf.parentElement
+                const digit = upperLeaf.closest('.flip-digit')
+                const staticUpperLeaf = digit?.querySelector('.flip-digit-static-top')
+                const staticLowerLeaf = digit?.querySelector('.flip-digit-static-bottom')
+                const staticUpperStage = staticUpperLeaf?.parentElement
+                const staticLowerStage = staticLowerLeaf?.parentElement
+                const stageMetrics = (stage) => {
+                  if (!stage) return null
+                  const style = getComputedStyle(stage)
+                  return {
+                    left: style.left,
+                    top: style.top,
+                    bottom: style.bottom,
+                    width: style.width,
+                    height: style.height,
+                    perspective: style.perspective,
+                    transform: style.transform,
+                  }
+                }
+                const leafMetrics = (leaf) => {
+                  if (!leaf) return null
+                  const style = getComputedStyle(leaf)
+                  const glyphStyle = getComputedStyle(leaf.querySelector('.flip-digit-glyph'))
+                  return {
+                    backgroundColor: style.backgroundColor,
+                    backgroundImage: style.backgroundImage,
+                    transformOrigin: style.transformOrigin,
+                    backfaceVisibility: style.backfaceVisibility,
+                    glyphTop: glyphStyle.top,
+                    glyphBottom: glyphStyle.bottom,
+                    glyphWidth: glyphStyle.width,
+                    glyphHeight: glyphStyle.height,
+                  }
+                }
                 return {
                   value: widget.querySelector('.desktop-timer-value')?.textContent || '',
                   upperAnimationName: getComputedStyle(upperLeaf).animationName,
+                  upperAnimationDuration: getComputedStyle(upperLeaf).animationDuration,
                   lowerAnimationName: getComputedStyle(lowerLeaf).animationName,
+                  lowerAnimationDuration: getComputedStyle(lowerLeaf).animationDuration,
                   lowerAnimationDelay: getComputedStyle(lowerLeaf).animationDelay,
                   upperBackgroundColor: getComputedStyle(upperLeaf).backgroundColor,
                   lowerBackgroundColor: getComputedStyle(lowerLeaf).backgroundColor,
@@ -7802,6 +7881,14 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
                   lowerBackfaceVisibility: getComputedStyle(lowerLeaf).backfaceVisibility,
                   upperStageOverflow: upperStage ? getComputedStyle(upperStage).overflow : '',
                   lowerStageOverflow: lowerStage ? getComputedStyle(lowerStage).overflow : '',
+                  upperStageMetrics: stageMetrics(upperStage),
+                  lowerStageMetrics: stageMetrics(lowerStage),
+                  staticUpperStageMetrics: stageMetrics(staticUpperStage),
+                  staticLowerStageMetrics: stageMetrics(staticLowerStage),
+                  upperLeafMetrics: leafMetrics(upperLeaf),
+                  lowerLeafMetrics: leafMetrics(lowerLeaf),
+                  staticUpperLeafMetrics: leafMetrics(staticUpperLeaf),
+                  staticLowerLeafMetrics: leafMetrics(staticLowerLeaf),
                 }
               }
               await new Promise((resolve) => setTimeout(resolve, 40))
@@ -7811,7 +7898,9 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
           if (
             flipAnimationUi?.value !== '41:59'
             || flipAnimationUi.upperAnimationName !== 'split-flap-fold'
+            || flipAnimationUi.upperAnimationDuration !== '0.22s'
             || flipAnimationUi.lowerAnimationName !== 'split-flap-unfold'
+            || flipAnimationUi.lowerAnimationDuration !== '0.24s'
             || flipAnimationUi.lowerAnimationDelay !== '0.22s'
             || flipAnimationUi.upperBackgroundColor !== 'rgb(18, 75, 63)'
             || flipAnimationUi.lowerBackgroundColor !== 'rgb(18, 75, 63)'
@@ -7821,8 +7910,48 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
             || flipAnimationUi.lowerBackfaceVisibility !== 'hidden'
             || !['hidden', 'clip'].includes(flipAnimationUi.upperStageOverflow)
             || !['hidden', 'clip'].includes(flipAnimationUi.lowerStageOverflow)
+            || JSON.stringify(flipAnimationUi.upperStageMetrics) !== JSON.stringify(flipAnimationUi.staticUpperStageMetrics)
+            || JSON.stringify(flipAnimationUi.lowerStageMetrics) !== JSON.stringify(flipAnimationUi.staticLowerStageMetrics)
+            || JSON.stringify(flipAnimationUi.upperLeafMetrics) !== JSON.stringify(flipAnimationUi.staticUpperLeafMetrics)
+            || JSON.stringify(flipAnimationUi.lowerLeafMetrics) !== JSON.stringify(flipAnimationUi.staticLowerLeafMetrics)
           ) {
             throw new Error(`pomodoro live split-flap mismatch: ${JSON.stringify(flipAnimationUi)}`)
+          }
+          const pomodoroCadenceUi = await pomodoroWindow?.webContents.executeJavaScript(`(() => new Promise((resolve) => {
+            const timerValue = document.querySelector('.widget-pomodoro .desktop-timer-value')
+            if (!timerValue) {
+              resolve(null)
+              return
+            }
+
+            const samples = []
+            let previousValue = timerValue.getAttribute('aria-label') || ''
+            let timeout = 0
+            const finish = () => {
+              observer.disconnect()
+              window.clearTimeout(timeout)
+              resolve({
+                samples,
+                intervals: samples.slice(1).map((sample, index) => sample.at - samples[index].at),
+              })
+            }
+            const observer = new MutationObserver(() => {
+              const value = timerValue.getAttribute('aria-label') || ''
+              if (!value || value === previousValue) return
+              previousValue = value
+              samples.push({ value, at: performance.now() })
+              if (samples.length >= 3) finish()
+            })
+
+            observer.observe(timerValue, { attributes: true, attributeFilter: ['aria-label'] })
+            timeout = window.setTimeout(finish, 3800)
+          }))()`)
+          if (
+            !pomodoroCadenceUi
+            || pomodoroCadenceUi.samples.length < 3
+            || pomodoroCadenceUi.intervals.some((interval) => interval < 850 || interval > 1150)
+          ) {
+            throw new Error(`pomodoro second cadence mismatch: ${JSON.stringify(pomodoroCadenceUi)}`)
           }
           await pomodoroWindow?.webContents.executeJavaScript(
             "document.querySelector('.widget-pomodoro [aria-label=\"重置\"]')?.click()",
@@ -7850,7 +7979,7 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
           ) {
             throw new Error(`pomodoro break-mode feedback mismatch: ${JSON.stringify({ breakModeUi, mode: breakPomodoro?.data?.mode })}`)
           }
-          console.log(`[desktop-geometry] pomodoro settings, mode feedback, two-stage split-flap, centered colon, and stable-start assertions passed: ${startedTimer}`)
+          console.log(`[desktop-geometry] pomodoro settings, mode feedback, two-stage split-flap, one-second cadence, centered colon, and stable-start assertions passed: ${startedTimer}`)
           const leftmostDisplay = [...currentDesktopInfo().displays]
             .sort((a, b) => a.bounds.x - b.bounds.x)[0]
           const leftmostDisplayId = leftmostDisplay?.id

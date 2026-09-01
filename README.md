@@ -92,6 +92,9 @@ npm run test:desktop-host
 npm run test:organizer-promotion
 npm run test:snapshots:integration
 npm run test:restore-guardian
+npm run test:widget-model
+npm run test:pomodoro-timing
+npm run test:pomodoro-flip
 ```
 
 桌面窗口、Explorer 图标位置和多屏缩放都涉及 Windows 原生接口。如果你准备修改这部分，建议先完整跑一遍上述测试，再用真实的多显示器环境验证。
