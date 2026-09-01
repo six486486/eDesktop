@@ -111,6 +111,10 @@ let desktopWindow = null
 const desktopOrganizerHostWindows = new Map()
 const desktopWindows = new Map()
 const desktopWidgetWindows = new Map()
+// Organizer DPI hand-offs are double buffered. Replacement windows live here
+// while their target-DPI Chromium surface is being prepared, but they do not
+// become the workspace window until that surface is complete.
+const desktopOrganizerTransitionWindows = new Set()
 const fileIconCache = new Map()
 let workspacePath = ''
 let workspaceState = null
@@ -3838,9 +3842,26 @@ const desktopWidgetPhysicalClientBounds = (_win, screenBounds) => {
   }
 }
 
-const queueDesktopOrganizerClientBounds = (win, screenBounds) => {
+const desktopWidgetLockedPreviewClientBounds = (win, screenBounds) => {
+  const targetBounds = desktopWidgetPhysicalClientBounds(win, screenBounds)
+  const sourceDisplay = desktopDisplayById(win?.desktopDisplayId)
+  const sourceScale = Number(sourceDisplay?.scaleFactor) || 1
+  return {
+    ...targetBounds,
+    // A parented Chromium HWND keeps the source monitor's backing surface
+    // until pointer capture ends. Growing its native client immediately to the
+    // target monitor's physical size exposes pixels Chromium has not rendered,
+    // which looks like the organizer was clipped. Keep the complete source
+    // surface during the gesture; the prepared target-DPI window takes over on
+    // pointer-up.
+    width: Math.max(1, Math.round(screenBounds.width * sourceScale)),
+    height: Math.max(1, Math.round(screenBounds.height * sourceScale)),
+  }
+}
+
+const queueDesktopOrganizerClientBounds = (win, screenBounds, clientBounds = null) => {
   if (!win || win.isDestroyed()) return
-  win.desktopPendingNativeClientBounds = desktopWidgetPhysicalClientBounds(win, screenBounds)
+  win.desktopPendingNativeClientBounds = clientBounds || desktopWidgetPhysicalClientBounds(win, screenBounds)
   if (win.desktopNativeClientBoundsInFlight) return
   win.desktopNativeClientBoundsInFlight = true
   const flush = async () => {
@@ -3887,6 +3908,18 @@ const setDesktopWidgetWindowPosition = (win, screenX, screenY) => {
   win.setPosition(screenX, screenY, false)
 }
 
+const setDesktopOrganizerLockedPreviewBounds = (win, screenBounds) => {
+  if (!win?.desktopOrganizerChildAttached) {
+    win?.setBounds(screenBounds, false)
+    return
+  }
+  queueDesktopOrganizerClientBounds(
+    win,
+    screenBounds,
+    desktopWidgetLockedPreviewClientBounds(win, screenBounds),
+  )
+}
+
 const roundedDesktopOrganizerShape = (width, height) => {
   const safeWidth = Math.max(1, Math.round(width))
   const safeHeight = Math.max(1, Math.round(height))
@@ -3922,14 +3955,23 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
     const display = desktopDisplayById(host.desktopDisplayId)
     if (!display) continue
     const shapeUnitScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
-    const organizers = workspaceState?.settings.desktopEnabled
-      ? workspaceState.widgets.filter((widget) => (
-        widget.kind === 'organizer'
-        && !widget.hidden
-        && desktopWidgetWindows.get(widget.id)?.desktopDisplayId === host.desktopDisplayId
-      ))
+    const organizerWindows = workspaceState?.settings.desktopEnabled
+      ? [...new Set([
+          ...workspaceDesktopOrganizerWindows(),
+          ...desktopOrganizerTransitionWindows,
+        ])].filter((win) => (
+          win
+          && !win.isDestroyed()
+          && win.desktopDisplayId === host.desktopDisplayId
+        ))
       : []
-    const shape = organizers.flatMap((widget) => {
+    const shape = organizerWindows.flatMap((organizerWindow) => {
+      const widget = workspaceState.widgets.find((candidate) => (
+        candidate.id === organizerWindow.desktopWidgetId
+        && candidate.kind === 'organizer'
+        && !candidate.hidden
+      ))
+      if (!widget) return []
       const bounds = desktopWidgetWindowBounds(widget)
       // Once the host is parented into Explorer, its region and organizer
       // children share physical client coordinates. Derive both from the same
@@ -3986,6 +4028,10 @@ const rebuildDesktopOrganizerHosts = async () => {
     desktopWidgetWindows.delete(win.desktopWidgetId)
     if (!win.isDestroyed()) win.destroy()
   }
+  for (const win of desktopOrganizerTransitionWindows) {
+    if (!win.isDestroyed()) win.destroy()
+  }
+  desktopOrganizerTransitionWindows.clear()
   for (const host of oldHosts) {
     if (!host.isDestroyed()) host.destroy()
   }
@@ -4055,6 +4101,54 @@ const recreateDesktopOrganizerWindow = async (win, widget, reason = 'geometry-re
   return createDesktopWidgetWindow(widget)
 }
 
+const cancelPreparedDesktopOrganizerTransition = (win) => {
+  const prepared = win?.desktopPreparedDisplayTransition
+  if (!prepared) return
+  prepared.cancelled = true
+  if (prepared.replacement && !prepared.replacement.isDestroyed()) prepared.replacement.destroy()
+  win.desktopPreparedDisplayTransition = null
+}
+
+const prepareDesktopOrganizerTransition = (win, displayId) => {
+  if (!win || win.isDestroyed() || !isOrganizerWidgetWindow(win)) return Promise.resolve(null)
+  const normalizedDisplayId = String(displayId)
+  const existing = win.desktopPreparedDisplayTransition
+  if (existing?.displayId === normalizedDisplayId && !existing.cancelled) return existing.promise
+  cancelPreparedDesktopOrganizerTransition(win)
+
+  const prepared = {
+    displayId: normalizedDisplayId,
+    cancelled: false,
+    replacement: null,
+    promise: null,
+  }
+  prepared.promise = (async () => {
+    await ensureDesktopOrganizerHostWindow(normalizedDisplayId)
+    if (prepared.cancelled || win.isDestroyed()) return null
+    const widget = workspaceState?.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
+    if (!widget || desktopWidgetDisplayId(widget) !== normalizedDisplayId) return null
+    const replacement = createDesktopWidgetWindow(widget, {
+      replacement: true,
+      deferReveal: true,
+    })
+    prepared.replacement = replacement
+    const ready = await Promise.race([
+      replacement.desktopReadyPromise,
+      new Promise((resolve) => setTimeout(() => resolve(false), 4_000)),
+    ])
+    if (prepared.cancelled || !ready || replacement.isDestroyed()) {
+      if (!replacement.isDestroyed()) replacement.destroy()
+      return null
+    }
+    return replacement
+  })().catch((error) => {
+    console.warn(`[desktop-geometry] organizer=${win.desktopWidgetId} DPI prewarm failed: ${error.message}`)
+    return null
+  })
+  win.desktopPreparedDisplayTransition = prepared
+  return prepared.promise
+}
+
 const transitionDesktopOrganizerToDisplay = async (win, displayId) => {
   if (!win || win.isDestroyed() || !isOrganizerWidgetWindow(win)) return false
   const normalizedDisplayId = String(displayId)
@@ -4065,14 +4159,75 @@ const transitionDesktopOrganizerToDisplay = async (win, displayId) => {
   win.desktopOrganizerDisplayTransitionInFlight = true
   win.desktopPendingDisplayId = null
   win.desktopAttachmentInFlight = true
+  let replacement = null
   try {
     const widget = workspaceState?.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
     if (!widget) return false
-    await ensureDesktopOrganizerHostWindow(normalizedDisplayId)
-    await recreateDesktopOrganizerWindow(win, widget, 'organizer-display-transition')
-    applyDesktopOrganizerHostShape()
+    replacement = await prepareDesktopOrganizerTransition(win, normalizedDisplayId)
+    if (!replacement || replacement.isDestroyed()) {
+      throw new Error('target-DPI organizer surface was not prepared')
+    }
+
+    const latestDisplayId = desktopWidgetDisplayId(widget)
+    if (latestDisplayId !== normalizedDisplayId) {
+      replacement.destroy()
+      replacement = null
+      win.desktopPendingDisplayId = latestDisplayId
+      return false
+    }
+
+    // The destination surface may have finished prewarming while the pointer
+    // was still moving. Align that hidden HWND to the final release rectangle
+    // and wait for the native move queue before making it visible.
+    syncDesktopWidgetWindowFrame(replacement, widget)
+    const alignmentDeadline = Date.now() + 1_500
+    while (
+      !replacement.isDestroyed()
+      && (replacement.desktopNativeClientBoundsInFlight || replacement.desktopPendingNativeClientBounds)
+      && Date.now() < alignmentDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 16))
+    }
+    if (replacement.isDestroyed()) throw new Error('prepared target-DPI organizer was lost before hand-off')
+
+    // Both HWNDs now occupy the final physical rectangle. Publish the fully
+    // painted target-DPI surface before retiring the source HWND, eliminating
+    // the blank/partial frame from the old destroy-then-create sequence.
+    replacement.desktopTransitionSourceHandle = getWindowHandle(win)
+    replacement.desktopTransitionSourcePreserved = (
+      !win.isDestroyed()
+      && win.isVisible()
+      && win.getOpacity() > 0.99
+      && replacement.desktopFirstFramePrepared === true
+      && replacement.desktopOrganizerChildAttached === true
+    )
+    desktopWidgetWindows.set(widget.id, replacement)
+    win.desktopPreparedDisplayTransition = null
+    replacement.desktopIsTransitionReplacement = false
+    applyDesktopOrganizerHostShape(normalizedDisplayId)
+    ensureDesktopOrganizerInteractive(replacement, { force: true })
+    replacement.setOpacity(1)
+    replacement.desktopFirstFrameRevealed = true
+    if (typeof replacement.webContents.invalidate === 'function') replacement.webContents.invalidate()
+    applyDesktopOrganizerBand()
+    const sourceDisplayId = win.desktopDisplayId
+    win.destroy()
+    desktopOrganizerTransitionWindows.delete(replacement)
+    applyDesktopOrganizerHostShape(sourceDisplayId)
+    applyDesktopOrganizerHostShape(normalizedDisplayId)
+    scheduleDesktopWidgetGeometryReconcile(replacement, {
+      reason: 'display-transition',
+      delays: [80, 260],
+      forceSurface: false,
+    })
     return true
+  } catch (error) {
+    if (replacement && !replacement.isDestroyed()) replacement.destroy()
+    cancelPreparedDesktopOrganizerTransition(win)
+    console.warn(`[desktop-geometry] organizer=${win.desktopWidgetId} display hand-off failed: ${error.message}`)
+    return false
   } finally {
+    if (replacement) desktopOrganizerTransitionWindows.delete(replacement)
     if (!win.isDestroyed()) {
       win.desktopAttachmentInFlight = false
       win.desktopOrganizerDisplayTransitionInFlight = false
@@ -4091,6 +4246,11 @@ const syncDesktopWidgetWindowFrame = (win, widget) => {
   const displayChanged = win.desktopDisplayId !== nextDisplayId
   if (widget.kind === 'organizer' && displayChanged && win.desktopOrganizerChildAttached) {
     win.desktopPendingDisplayId = nextDisplayId
+    // Start creating and painting the destination-DPI surface as soon as the
+    // pointer crosses a monitor boundary. Pointer capture remains on the old
+    // HWND; on release the already-prepared replacement can be published in a
+    // single frame instead of making the user wait for a new renderer.
+    void prepareDesktopOrganizerTransition(win, nextDisplayId)
     if (!win.desktopInteractionLocked) {
       void transitionDesktopOrganizerToDisplay(win, nextDisplayId)
       return
@@ -4102,7 +4262,7 @@ const syncDesktopWidgetWindowFrame = (win, widget) => {
     // organizer to the monitor edge until pointer-up.
     const nextBounds = desktopWidgetWindowBounds(widget)
     win.desktopProgrammaticMoveUntil = Date.now() + 150
-    setDesktopWidgetWindowPosition(win, nextBounds.x, nextBounds.y)
+    setDesktopOrganizerLockedPreviewBounds(win, nextBounds)
     win.desktopRequestedBounds = nextBounds
     applyDesktopOrganizerHostShape(win.desktopDisplayId)
     return
@@ -4110,6 +4270,7 @@ const syncDesktopWidgetWindowFrame = (win, widget) => {
   if (widget.kind === 'organizer' && win.desktopInteractionLocked) {
     // The pointer can cross a boundary and come back before release.
     win.desktopPendingDisplayId = null
+    cancelPreparedDesktopOrganizerTransition(win)
   }
   win.desktopDisplayId = nextDisplayId
   if (widget.kind === 'organizer') syncDesktopOrganizerRendererScale(win)
@@ -4311,9 +4472,9 @@ const revealDesktopWidgetFirstFrame = async (win) => {
   return true
 }
 
-const createDesktopWidgetWindow = (widget) => {
+const createDesktopWidgetWindow = (widget, options = {}) => {
   const existing = desktopWidgetWindows.get(widget.id)
-  if (existing && !existing.isDestroyed()) {
+  if (existing && !existing.isDestroyed() && !options.replacement) {
     syncDesktopWidgetWindowFrame(existing, widget)
     return existing
   }
@@ -4357,6 +4518,11 @@ const createDesktopWidgetWindow = (widget) => {
   win.desktopOrganizerRendererBaseScale = initialRendererScale
   win.desktopOrganizerZoomFactor = initialZoomFactor
   win.desktopRequestedBounds = requestedBounds
+  win.desktopIsTransitionReplacement = Boolean(options.replacement)
+  let resolveDesktopReady
+  win.desktopReadyPromise = new Promise((resolve) => {
+    resolveDesktopReady = resolve
+  })
   // Exclude the HWND from organizer health checks from construction
   // until its first desktop attachment has fully completed.
   win.desktopAttachmentInFlight = true
@@ -4371,7 +4537,8 @@ const createDesktopWidgetWindow = (widget) => {
     win.showInactive()
     win.setBounds(requestedBounds, false)
   }
-  desktopWidgetWindows.set(widget.id, win)
+  if (options.replacement) desktopOrganizerTransitionWindows.add(win)
+  else desktopWidgetWindows.set(widget.id, win)
   if (!desktopWindow || desktopWindow.isDestroyed()) desktopWindow = win
   loadSurface(win, 'desktop', {
     widgetId: widget.id,
@@ -4388,12 +4555,28 @@ const createDesktopWidgetWindow = (widget) => {
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
       await attachDesktopWindow(win)
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
-      await revealDesktopWidgetFirstFrame(win)
+      if (options.deferReveal) {
+        // The window must stay genuinely invisible until the old source-DPI
+        // HWND is still present at the same rectangle. Its compositor surface
+        // has already been forced to commit by prepareDesktopWidgetFirstFrame.
+        await win.webContents.executeJavaScript(`new Promise((resolve) => {
+          window.dispatchEvent(new Event('resize'))
+          requestAnimationFrame(() => requestAnimationFrame(resolve))
+        })`)
+        if (typeof win.webContents.invalidate === 'function') win.webContents.invalidate()
+        await win.webContents.capturePage()
+        win.setOpacity(0)
+        win.desktopFirstFrameRevealed = false
+      } else {
+        await revealDesktopWidgetFirstFrame(win)
+      }
+      resolveDesktopReady(Boolean(win.desktopOrganizerChildAttached || widget.kind !== 'organizer'))
     } catch (error) {
       if (!win.isDestroyed()) {
-        win.setOpacity(1)
+        if (!options.deferReveal) win.setOpacity(1)
         console.error(`[desktop-host] widget=${widget.id} startup attachment failed: ${error.message}`)
       }
+      resolveDesktopReady(false)
     } finally {
       if (!win.isDestroyed()) win.desktopAttachmentInFlight = false
       refreshDesktopHostStatus()
@@ -4422,8 +4605,12 @@ const createDesktopWidgetWindow = (widget) => {
     })
   })
   win.on('closed', () => {
-    desktopWidgetGeometryRecoveryTokens.delete(widget.id)
-    desktopWidgetGeometryMismatchCounts.delete(widget.id)
+    resolveDesktopReady(false)
+    desktopOrganizerTransitionWindows.delete(win)
+    if (!win.desktopIsTransitionReplacement) {
+      desktopWidgetGeometryRecoveryTokens.delete(widget.id)
+      desktopWidgetGeometryMismatchCounts.delete(widget.id)
+    }
     if (desktopWidgetWindows.get(widget.id) === win) desktopWidgetWindows.delete(widget.id)
     if (desktopWindow === win) desktopWindow = liveDesktopWindows()[0] || null
   })
@@ -4699,12 +4886,18 @@ const runDesktopWidgetWindowRegression = () => {
         }, 1_200)
         const previewMetric = Array.isArray(previewMetrics) ? previewMetrics[0] : previewMetrics
         const expectedPreviewRect = physicalScreenRect(desktopWidgetWindowBounds(mixedDpiWidget))
+        const expectedLockedPreviewRect = desktopWidgetLockedPreviewClientBounds(
+          mixedDpiWindow,
+          desktopWidgetWindowBounds(mixedDpiWidget),
+        )
         const previewInvalid = (
           desktopWidgetWindows.get(mixedDpiWidget.id) !== mixedDpiWindow
           || getWindowHandle(mixedDpiWindow) !== dragPreviewHandle
           || mixedDpiWindow.desktopPendingDisplayId !== String(mixedDpiTargetDisplay.id)
           || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'X')) - expectedPreviewRect.x) > 3
           || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'Y')) - expectedPreviewRect.y) > 3
+          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'ClientWidth')) - expectedLockedPreviewRect.width) > 3
+          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'ClientHeight')) - expectedLockedPreviewRect.height) > 3
         )
         desktopOrganizerBandHealthInFlight = false
         if (previewInvalid) {
@@ -4712,12 +4905,19 @@ const runDesktopWidgetWindowRegression = () => {
             pendingDisplayId: mixedDpiWindow.desktopPendingDisplayId,
             previewMetric,
             expectedPreviewRect,
+            expectedLockedPreviewRect,
           })}`)
         }
         finishDesktopWindowInteraction(mixedDpiWindow)
         mixedDpiWindow = await waitForMixedDpiWindow()
         if (!mixedDpiWindow || mixedDpiWindow.isDestroyed()) {
           throw new Error('mixed-DPI move did not recreate the organizer on its target display')
+        }
+        if (
+          mixedDpiWindow.desktopTransitionSourceHandle !== dragPreviewHandle
+          || mixedDpiWindow.desktopTransitionSourcePreserved !== true
+        ) {
+          throw new Error('mixed-DPI move was not switched from a prepared double-buffered surface')
         }
         await reconcileDesktopWidgetGeometry(mixedDpiWindow, {
           reason: 'mixed-dpi-regression',
@@ -4763,10 +4963,50 @@ const runDesktopWidgetWindowRegression = () => {
         await assertMixedDpiHostShape('move')
 
         Object.assign(mixedDpiWidget, originalFrame)
+        const restorePreviewHandle = getWindowHandle(mixedDpiWindow)
+        desktopOrganizerBandHealthInFlight = true
+        mixedDpiWindow.desktopInteractionLocked = true
+        mixedDpiWindow.desktopInteractionLockedAt = Date.now()
         syncDesktopWidgetWindowFrame(mixedDpiWindow, mixedDpiWidget)
+        const restorePreviewDeadline = Date.now() + 2_000
+        while (
+          (mixedDpiWindow.desktopNativeClientBoundsInFlight || mixedDpiWindow.desktopPendingNativeClientBounds)
+          && Date.now() < restorePreviewDeadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 30))
+        }
+        const restorePreviewMetrics = await desktopIconHelperRequest('window-geometries', {
+          hwnds: [restorePreviewHandle],
+        }, 1_200)
+        const restorePreviewMetric = Array.isArray(restorePreviewMetrics)
+          ? restorePreviewMetrics[0]
+          : restorePreviewMetrics
+        const expectedRestorePreviewRect = desktopWidgetLockedPreviewClientBounds(
+          mixedDpiWindow,
+          desktopWidgetWindowBounds(mixedDpiWidget),
+        )
+        if (
+          desktopWidgetWindows.get(mixedDpiWidget.id) !== mixedDpiWindow
+          || mixedDpiWindow.desktopPendingDisplayId !== String(mixedDpiSourceDisplay.id)
+          || Math.abs(Number(desktopWidgetGeometryMetricValue(restorePreviewMetric, 'ClientWidth')) - expectedRestorePreviewRect.width) > 3
+          || Math.abs(Number(desktopWidgetGeometryMetricValue(restorePreviewMetric, 'ClientHeight')) - expectedRestorePreviewRect.height) > 3
+        ) {
+          throw new Error(`mixed-DPI reverse locked preview exposed an incomplete surface: ${JSON.stringify({
+            restorePreviewMetric,
+            expectedRestorePreviewRect,
+          })}`)
+        }
+        desktopOrganizerBandHealthInFlight = false
+        finishDesktopWindowInteraction(mixedDpiWindow)
         mixedDpiWindow = await waitForMixedDpiWindow()
         if (!mixedDpiWindow || mixedDpiWindow.isDestroyed()) {
           throw new Error('mixed-DPI restore did not recreate the organizer on its source display')
+        }
+        if (
+          mixedDpiWindow.desktopTransitionSourceHandle !== restorePreviewHandle
+          || mixedDpiWindow.desktopTransitionSourcePreserved !== true
+        ) {
+          throw new Error('mixed-DPI restore was not switched from a prepared double-buffered surface')
         }
         await reconcileDesktopWidgetGeometry(mixedDpiWindow, {
           reason: 'mixed-dpi-restore-regression',
