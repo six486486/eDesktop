@@ -132,6 +132,7 @@ let desktopHostState = 'disabled'
 let desktopStatusMessage = '桌面组件尚未启用'
 let displayRefreshTimer = null
 let displayRefreshRevision = 0
+let desktopTopologyTransitionRevision = 0
 let desktopTopologySignature = ''
 let desktopPointerHitTestTimer = null
 let desktopOrganizerBandHealthTimer = null
@@ -1984,7 +1985,11 @@ const updateWorkspace = async (nextState) => {
   // Startup storage reconciliation can update the workspace before IPC exists.
   // Creating renderer windows in that interval makes their first preload calls
   // fail and forces the windows through an unnecessary blank/timeout cycle.
-  if (ipcHandlersRegistered) syncDesktopWidgetWindows()
+  // A display add/remove transaction destroys every old native widget HWND.
+  // Renderer IPC may still finish while that transaction is in flight; do not
+  // let such a write recreate one stale window between the teardown and the
+  // topology-wide rebuild.
+  if (ipcHandlersRegistered && !desktopTopologyTransitionRevision) syncDesktopWidgetWindows()
   broadcastWorkspace()
   await persistWorkspace()
   if (!snapshotRestoreInProgress) void maybeCreateAutomaticSnapshot('定时自动快照')
@@ -2733,25 +2738,36 @@ const scheduleDisplayRefresh = () => {
   const revision = ++displayRefreshRevision
   if (displayRefreshTimer) clearTimeout(displayRefreshTimer)
   displayRefreshTimer = setTimeout(async () => {
+    let ownsTopologyTransition = false
     try {
       displayRefreshTimer = null
       const settledSignature = await waitForStableDisplayTopology({ stableMs: 750, timeoutMs: 3_500 })
       if (revision !== displayRefreshRevision) return
       const confirmedTopologyChange = settledSignature !== desktopTopologySignature
       if (confirmedTopologyChange) {
-        const remapped = await remapWorkspaceForCurrentDesktop()
+        desktopTopologyTransitionRevision = revision
+        ownsTopologyTransition = true
+        const remapped = await enqueueWorkspaceMutation(async () => {
+          if (revision !== displayRefreshRevision) return null
+          const result = await remapWorkspaceForCurrentDesktop()
+          if (revision !== displayRefreshRevision) return null
+          if (constrainWorkspaceWidgetFrames()) result.changed = true
+          if (result.changed) await persistWorkspace()
+          return result
+        })
+        if (!remapped) return
         if (revision !== displayRefreshRevision) return
-        if (remapped.changed) await persistWorkspace()
-        desktopTopologySignature = settledSignature
       }
       if (useDesktopWidgetWindows) {
-        if (confirmedTopologyChange) await rebuildDesktopOrganizerHosts()
+        if (confirmedTopologyChange) await rebuildDesktopWidgetWindowsForTopology(revision)
         else await ensureDesktopOrganizerHostWindows()
+        if (revision !== displayRefreshRevision) return
         if (constrainWorkspaceWidgetFrames()) await persistWorkspace()
         syncDesktopWidgetWindows()
         broadcastDesktopInfo()
         broadcastWorkspace()
         if (workspaceState?.settings.desktopEnabled) await attachMissingDesktopWindows()
+        if (confirmedTopologyChange) desktopTopologySignature = settledSignature
         // A metrics notification with an unchanged topology is not evidence of
         // damaged widget geometry. Windows emits these while native children are
         // still attaching; auditing every organizer at that moment used to turn
@@ -2779,8 +2795,13 @@ const scheduleDisplayRefresh = () => {
         broadcastWorkspace()
       }
       if (workspaceState?.settings.desktopEnabled) await attachDesktopWindows()
+      if (confirmedTopologyChange) desktopTopologySignature = settledSignature
     } catch (error) {
       console.error(`[desktop-host] display refresh failed: ${error.message}`)
+    } finally {
+      if (ownsTopologyTransition && desktopTopologyTransitionRevision === revision) {
+        desktopTopologyTransitionRevision = 0
+      }
     }
   }, 850)
 }
@@ -3029,6 +3050,7 @@ const refreshDesktopWidgetGeometryHealth = async () => {
   const now = Date.now()
   if (
     desktopWidgetGeometryHealthInFlight
+    || desktopTopologyTransitionRevision
     || now - desktopWidgetGeometryHealthLastAt < 750
     || !workspaceState?.settings.desktopEnabled
     || liveDesktopWidgetWindows().some((win) => win.desktopInteractionLocked)
@@ -4280,29 +4302,69 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
   }
 }
 
-const rebuildDesktopOrganizerHosts = async () => {
-  if (!useDesktopWidgetWindows || !workspaceState?.settings.desktopEnabled) return []
-  if (useIndividualOrganizerDesktopChildren) {
-    syncDesktopWidgetWindows()
-    return []
-  }
-  const oldHosts = liveDesktopOrganizerHostWindows()
-  const organizerWindows = desktopOrganizerBandWindows()
-  for (const win of organizerWindows) {
+const rebuildDesktopWidgetWindowsForTopology = async (transitionRevision) => {
+  if (!useDesktopWidgetWindows || !workspaceState) return []
+
+  // A native child HWND keeps DPI, parent and Chromium surface state from the
+  // desktop topology in which it was created. Reusing it after a monitor is
+  // removed can leave a perfectly valid workspace frame represented by an
+  // off-screen or clipped native surface. Treat a topology change like Windows
+  // does for shell surfaces: keep the logical layout, replace every native
+  // component window, then attach each replacement against the settled screens.
+  closeActiveOrganizerContextMenu()
+  activeOrganizerFileSelection = null
+  organizerFileSelectionRevision += 1
+  desktopOrganizerDeferredPromotions.clear()
+  desktopWidgetGeometryRecoveryTokens.clear()
+  desktopWidgetGeometryMismatchCounts.clear()
+
+  const oldWindows = liveDesktopWidgetWindows()
+  for (const win of oldWindows) {
+    if (win.desktopNativeMoveFinishTimer) clearTimeout(win.desktopNativeMoveFinishTimer)
+    if (win.desktopOrganizerScaleStabilizationTimer) clearTimeout(win.desktopOrganizerScaleStabilizationTimer)
+    win.desktopOrganizerDisplayFrameRevision = (win.desktopOrganizerDisplayFrameRevision || 0) + 1
     desktopWidgetWindows.delete(win.desktopWidgetId)
     if (!win.isDestroyed()) win.destroy()
   }
+  desktopWidgetWindows.clear()
+  desktopWindow = null
+
+  const oldHosts = liveDesktopOrganizerHostWindows()
   for (const host of oldHosts) {
     if (!host.isDestroyed()) host.destroy()
   }
   desktopOrganizerHostWindows.clear()
+
+  if (transitionRevision !== displayRefreshRevision) return []
+  if (!workspaceState.settings.desktopEnabled) return []
   await ensureDesktopOrganizerHostWindows()
-  for (const widget of workspaceState.widgets) {
-    if (widget.kind === 'organizer' && !widget.hidden) createDesktopWidgetWindow(widget)
+  if (transitionRevision !== displayRefreshRevision) return []
+
+  const windows = syncDesktopWidgetWindows()
+  let readinessTimedOut = false
+  let readinessTimer = null
+  await Promise.race([
+    Promise.allSettled(windows.map((win) => win.desktopReadyPromise)),
+    new Promise((resolve) => {
+      readinessTimer = setTimeout(() => {
+        readinessTimedOut = true
+        resolve()
+      }, 8_000)
+    }),
+  ])
+  if (readinessTimer) clearTimeout(readinessTimer)
+  if (readinessTimedOut) {
+    console.warn(`[desktop-host] topology=${transitionRevision} widget rebuild readiness timed out`)
   }
+  if (transitionRevision !== displayRefreshRevision) return windows
+
+  // Re-read the latest logical frames after every replacement has attached.
+  // This is intentionally a sync, not another remap: DPI never changes the
+  // stored component width/height.
+  syncDesktopWidgetWindows()
   applyDesktopOrganizerHostShape()
   applyDesktopOrganizerBand()
-  return liveDesktopOrganizerHostWindows()
+  return windows
 }
 
 const applyDesktopOrganizerWindowShape = (win, bounds) => {
@@ -6507,6 +6569,38 @@ const runDesktopOrganizerPromotionRegression = () => {
         throw new Error(`single organizer style drift touched siblings: ${repairedStyle}`)
       }
       console.log('[desktop-host] organizer anti-flicker assertion passed: hover=0 writes; unrelated child ignored; style repair=1 HWND')
+
+      const topologyFramesBefore = new Map(workspaceState.widgets.map((widget) => [
+        widget.id,
+        { x: widget.x, y: widget.y, width: widget.width, height: widget.height },
+      ]))
+      const topologyWindowsBefore = new Map(liveDesktopWidgetWindows().map((win) => [
+        win.desktopWidgetId,
+        win,
+      ]))
+      desktopTopologyTransitionRevision = -1
+      const rebuiltWindows = await rebuildDesktopWidgetWindowsForTopology(displayRefreshRevision)
+      desktopTopologyTransitionRevision = 0
+      const rebuiltById = new Map(rebuiltWindows.map((win) => [win.desktopWidgetId, win]))
+      if (
+        rebuiltWindows.length !== topologyWindowsBefore.size
+        || [...topologyWindowsBefore].some(([widgetId, oldWindow]) => {
+          const replacement = rebuiltById.get(widgetId)
+          return !replacement
+            || replacement.isDestroyed()
+            || replacement === oldWindow
+            || !oldWindow.isDestroyed()
+            || replacement.desktopAttached !== true
+            || (isOrganizerWidgetWindow(replacement) && replacement.desktopOrganizerChildAttached !== true)
+        })
+        || workspaceState.widgets.some((widget) => (
+          JSON.stringify(topologyFramesBefore.get(widget.id))
+          !== JSON.stringify({ x: widget.x, y: widget.y, width: widget.width, height: widget.height })
+        ))
+      ) {
+        throw new Error('display topology rebuild reused a stale HWND, lost an attachment or changed logical geometry')
+      }
+      console.log(`[desktop-host] topology rebuild assertion passed: ${rebuiltWindows.length} HWNDs replaced; logical frames unchanged`)
     } catch (error) {
       console.error(`[desktop-host] focused organizer promotion test failed: ${error.message}`)
       process.exitCode = 1
@@ -8066,6 +8160,10 @@ app.on('before-quit', (event) => {
 })
 
 app.on('window-all-closed', () => {
+  // During a monitor topology transaction every component HWND is replaced as
+  // one batch. The empty interval is intentional and must not terminate the
+  // process before the replacement windows are created.
+  if (desktopTopologyTransitionRevision) return
   if (process.platform !== 'darwin') app.quit()
 })
 
