@@ -156,6 +156,9 @@ function WidgetShell({
 }: WidgetShellProps) {
   const api = window.desktopAPI
   const useNativeCursor = new URLSearchParams(window.location.search).get('nativeCursor') !== '0'
+  const useNativeWindowDrag = widget.kind === 'organizer'
+    && windowMargin !== undefined
+    && new URLSearchParams(window.location.search).get('nativeWindowDrag') !== '0'
   const [frame, setFrame] = useState({ x: widget.x, y: widget.y, width: widget.width, height: widget.height })
   const [titleDraft, setTitleDraft] = useState(widget.title)
   const frameRef = useRef(frame)
@@ -294,7 +297,7 @@ function WidgetShell({
 
   return (
     <section
-      className={`desktop-widget tone-${widget.tone} widget-${widget.kind}`}
+      className={`desktop-widget tone-${widget.tone} widget-${widget.kind} ${useNativeWindowDrag ? 'uses-native-window-drag' : ''}`}
       data-widget-id={widget.id}
       style={{
         left: windowMargin ?? frame.x - displayBounds.x,
@@ -305,7 +308,7 @@ function WidgetShell({
     >
       <div
         className={`desktop-widget-header widget-drag-handle ${widget.kind === 'pomodoro' ? 'is-compact' : ''}`}
-        onPointerDown={windowMargin === undefined || widget.kind === 'organizer' ? beginDrag : undefined}
+        onPointerDown={windowMargin === undefined || (widget.kind === 'organizer' && !useNativeWindowDrag) ? beginDrag : undefined}
       >
         {widget.kind === 'pomodoro' && (
           <button

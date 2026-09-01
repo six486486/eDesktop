@@ -116,10 +116,6 @@ const desktopWidgetWindows = new Map()
 // per-display parent couples clipping, DPI and pointer coordinates and makes a
 // cross-monitor drag depend on two HWND hierarchies changing in sync.
 const useIndividualOrganizerDesktopChildren = true
-// Organizer DPI hand-offs are double buffered. Replacement windows live here
-// while their target-DPI Chromium surface is being prepared, but they do not
-// become the workspace window until that surface is complete.
-const desktopOrganizerTransitionWindows = new Set()
 const fileIconCache = new Map()
 let workspacePath = ''
 let workspaceState = null
@@ -2511,7 +2507,11 @@ const refreshDesktopOrganizerBandHealth = async () => {
 }
 
 const startDesktopOrganizerBandHealth = () => {
-  if (desktopOrganizerBandHealthTimer || !useDesktopWidgetWindows) return
+  // Normal interaction never runs a periodic organizer repair. Reparenting or
+  // z-order mutation during a click/drag is visible as a sibling compositor
+  // flash and can invalidate Chromium pointer capture. Display/GPU events and
+  // explicit diagnostics still invoke the targeted recovery path.
+  if (!desktopHostTest || desktopOrganizerBandHealthTimer || !useDesktopWidgetWindows) return
   desktopOrganizerBandHealthTimer = setInterval(() => {
     void refreshDesktopOrganizerBandHealth()
     // Child Z-order is owned by Progman and does not need continuous global
@@ -2612,11 +2612,15 @@ const desktopWidgetGeometryMetricValue = (metric, key) => metric?.[key] ?? metri
 const desktopWidgetExpectedPhysicalSize = (widget, metric) => {
   const requestedBounds = desktopWidgetWindowBounds(widget)
   const widgetWindow = desktopWidgetWindows.get(widget.id)
-  const display = widgetWindow && isOrganizerWidgetWindow(widgetWindow)
+  const organizerUsesExplorerScale = useIndividualOrganizerDesktopChildren
+    && widgetWindow
+    && isOrganizerWidgetWindow(widgetWindow)
+  const display = !organizerUsesExplorerScale && widgetWindow && isOrganizerWidgetWindow(widgetWindow)
     ? desktopDisplayById(widgetWindow.desktopDisplayId)
     : null
-  const scaleFactor = display?.scaleFactor
-    || (Number(desktopWidgetGeometryMetricValue(metric, 'Dpi')) || 96) / 96
+  const scaleFactor = organizerUsesExplorerScale
+    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+    : display?.scaleFactor || (Number(desktopWidgetGeometryMetricValue(metric, 'Dpi')) || 96) / 96
   return {
     width: Math.max(1, Math.round(requestedBounds.width * scaleFactor)),
     height: Math.max(1, Math.round(requestedBounds.height * scaleFactor)),
@@ -2694,6 +2698,9 @@ const inspectDesktopWidgetRendererGeometry = async (win) => {
 const desktopWidgetRendererGeometryMismatch = (widget, renderer) => {
   if (!renderer) return true
   const targetDisplay = screen.getAllDisplays().find((display) => String(display.id) === desktopWidgetDisplayId(widget))
+  const expectedRendererScale = widget.kind === 'organizer' && useIndividualOrganizerDesktopChildren
+    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+    : targetDisplay?.scaleFactor
   const innerWidth = Number(renderer.innerWidth)
   const innerHeight = Number(renderer.innerHeight)
   const widgetWidth = Number(renderer.widgetWidth)
@@ -2707,7 +2714,7 @@ const desktopWidgetRendererGeometryMismatch = (widget, renderer) => {
     || innerHeight - widgetHeight > 6
     || Math.abs(widgetWidth - widget.width) > 1
     || Math.abs(widgetHeight - widget.height) > 1
-    || (targetDisplay && Math.abs(Number(renderer.devicePixelRatio) - targetDisplay.scaleFactor) > 0.01)
+    || (expectedRendererScale && Math.abs(Number(renderer.devicePixelRatio) - expectedRendererScale) > 0.01)
   )
 }
 
@@ -2764,12 +2771,6 @@ const reconcileDesktopWidgetGeometry = async (win, options = {}) => {
     const renderer = await inspectDesktopWidgetRendererGeometry(win)
     const nativeMismatch = desktopWidgetNativeGeometryMismatch(widget, metric, renderer)
     const rendererMismatch = desktopWidgetRendererGeometryMismatch(widget, renderer)
-
-    if (widget.kind === 'organizer' && (nativeMismatch || rendererMismatch)) {
-      await recreateDesktopOrganizerWindow(win, widget, reason)
-      console.warn(`[desktop-geometry] recreated organizer=${widget.id} reason=${reason} native=${nativeMismatch} renderer=${rendererMismatch}`)
-      return true
-    }
 
     if (nativeMismatch) {
       const requestedBounds = desktopWidgetWindowBounds(widget)
@@ -2835,7 +2836,8 @@ const refreshDesktopWidgetGeometryHealth = async () => {
     || liveDesktopWidgetWindows().some((win) => win.desktopInteractionLocked)
   ) return false
   const windows = liveDesktopWidgetWindows().filter((win) => (
-    !win.desktopAttachmentInFlight
+    !isOrganizerWidgetWindow(win)
+    && !win.desktopAttachmentInFlight
     && !win.desktopInteractionLocked
     && !win.desktopNativeClientBoundsInFlight
     && !win.desktopPendingNativeClientBounds
@@ -2902,7 +2904,9 @@ const runDesktopHostHelper = async (win, options = {}) => {
     getWindowHandle(win),
   ]
   const helperDisplay = desktopDisplayById(win.desktopDisplayId)
-  const helperClientScale = Number(helperDisplay?.scaleFactor) || 1
+  const helperClientScale = useIndividualOrganizerDesktopChildren && isOrganizerWidgetWindow(win)
+    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+    : Number(helperDisplay?.scaleFactor) || 1
   args.push('-ClientScale', String(helperClientScale))
   if (options.noActivate) args.push('-NoActivate')
   if (options.desktopChild) args.push('-DesktopChild')
@@ -3108,10 +3112,7 @@ const finishDesktopWindowInteraction = (win) => {
   const promoteAfterGesture = organizerWindow && win.desktopOrganizerPromotionPending === true
   win.desktopInteractionLocked = false
   win.desktopInteractionLockedAt = 0
-  const pendingDisplayId = organizerWindow ? win.desktopPendingDisplayId : null
-  if (pendingDisplayId && pendingDisplayId !== win.desktopDisplayId) {
-    void transitionDesktopOrganizerToDisplay(win, pendingDisplayId)
-  }
+  if (organizerWindow) win.desktopPendingDisplayId = null
   if (!promoteAfterGesture) return
   if (desktopOrganizerBandHealthInFlight) {
     desktopOrganizerDeferredPromotions.add(win)
@@ -3139,7 +3140,7 @@ const lowerDesktopOrganizerWindow = async (win) => {
     win.desktopOrganizerLayerResult = hostResult
     win.desktopOrganizerChildAttached = hostResult.includes('placement=desktop-child')
     win.desktopOrganizerLayeredAt = Date.now()
-    syncDesktopOrganizerRendererScale(win)
+    if (!useIndividualOrganizerDesktopChildren) syncDesktopOrganizerRendererScale(win)
     win.desktopOrganizerShapeApplied = false
     const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
     if (widget) {
@@ -3224,7 +3225,7 @@ const attachDesktopWindow = async (win) => {
     if (organizerWindow) {
       win.desktopOrganizerLayerResult = hostResult
       win.desktopOrganizerChildAttached = hostResult.includes('placement=desktop-child')
-      syncDesktopOrganizerRendererScale(win)
+      if (!useIndividualOrganizerDesktopChildren) syncDesktopOrganizerRendererScale(win)
       win.desktopOrganizerShapeApplied = false
       const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
       if (widget) {
@@ -3731,6 +3732,25 @@ const physicalVirtualScreenBounds = () => {
   return { x: left, y: top, width: right - left, height: bottom - top }
 }
 
+const dipScreenPointFromPhysical = (point) => {
+  const candidates = screen.getAllDisplays().map((display) => ({
+    display,
+    physical: physicalScreenRect(display.workArea),
+  }))
+  const target = candidates.reduce((nearest, candidate) => {
+    if (!nearest) return candidate
+    return distanceToBounds(point, candidate.physical) < distanceToBounds(point, nearest.physical)
+      ? candidate
+      : nearest
+  }, null)
+  if (!target) return point
+  const scale = Number(target.display.scaleFactor) || 1
+  return {
+    x: target.display.workArea.x + (point.x - target.physical.x) / scale,
+    y: target.display.workArea.y + (point.y - target.physical.y) / scale,
+  }
+}
+
 const desktopOrganizerHostBounds = () => {
   const physicalVirtualBounds = physicalVirtualScreenBounds()
   return {
@@ -3836,6 +3856,15 @@ const desktopWidgetWindowBounds = (widget) => {
 
 const desktopWidgetNativeBounds = (win, screenBounds) => {
   if (!win?.desktopOrganizerChildAttached) return screenBounds
+  if (useIndividualOrganizerDesktopChildren) {
+    const clientBounds = desktopWidgetPhysicalClientBounds(win, screenBounds)
+    return {
+      x: 0,
+      y: 0,
+      width: clientBounds.width,
+      height: clientBounds.height,
+    }
+  }
   const display = desktopDisplayById(win.desktopDisplayId)
   if (!display) return screenBounds
   const ratio = desktopOrganizerHostScaleRatio(win.desktopDisplayId)
@@ -3847,31 +3876,22 @@ const desktopWidgetNativeBounds = (win, screenBounds) => {
   }
 }
 
-const desktopWidgetPhysicalClientBounds = (_win, screenBounds) => {
+const desktopWidgetPhysicalClientBounds = (win, screenBounds) => {
   const physicalBounds = physicalScreenRect(screenBounds)
   const physicalVirtualBounds = physicalVirtualScreenBounds()
+  const usesStableExplorerScale = useIndividualOrganizerDesktopChildren
+    && (!win || isOrganizerWidgetWindow(win))
+  const sizeScale = usesStableExplorerScale
+    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+    : null
   return {
     x: Math.round(physicalBounds.x - physicalVirtualBounds.x),
     y: Math.round(physicalBounds.y - physicalVirtualBounds.y),
-    width: Math.max(1, Math.round(physicalBounds.width)),
-    height: Math.max(1, Math.round(physicalBounds.height)),
-  }
-}
-
-const desktopWidgetLockedPreviewClientBounds = (win, screenBounds) => {
-  const targetBounds = desktopWidgetPhysicalClientBounds(win, screenBounds)
-  const sourceDisplay = desktopDisplayById(win?.desktopDisplayId)
-  const sourceScale = Number(sourceDisplay?.scaleFactor) || 1
-  return {
-    ...targetBounds,
-    // A parented Chromium HWND keeps the source monitor's backing surface
-    // until pointer capture ends. Growing its native client immediately to the
-    // target monitor's physical size exposes pixels Chromium has not rendered,
-    // which looks like the organizer was clipped. Keep the complete source
-    // surface during the gesture; the prepared target-DPI window takes over on
-    // pointer-up.
-    width: Math.max(1, Math.round(screenBounds.width * sourceScale)),
-    height: Math.max(1, Math.round(screenBounds.height * sourceScale)),
+    // Explorer's desktop children share the primary desktop host DPI. Keep a
+    // single physical size basis on every monitor; changing this scale at the
+    // monitor boundary is what made the organizer visibly grow or shrink.
+    width: Math.max(1, Math.round(sizeScale ? screenBounds.width * sizeScale : physicalBounds.width)),
+    height: Math.max(1, Math.round(sizeScale ? screenBounds.height * sizeScale : physicalBounds.height)),
   }
 }
 
@@ -3910,6 +3930,11 @@ const queueDesktopOrganizerClientBounds = (win, screenBounds, clientBounds = nul
 const setDesktopWidgetWindowBounds = (win, screenBounds) => {
   if (win?.desktopOrganizerChildAttached) {
     queueDesktopOrganizerClientBounds(win, screenBounds)
+    setTimeout(() => {
+      if (!win.isDestroyed() && !win.desktopNativeClientBoundsInFlight && !win.desktopPendingNativeClientBounds) {
+        void syncDesktopOrganizerRenderChildBounds(win)
+      }
+    }, 80)
     return
   }
   win.setBounds(screenBounds, false)
@@ -3922,18 +3947,6 @@ const setDesktopWidgetWindowPosition = (win, screenX, screenY) => {
     return
   }
   win.setPosition(screenX, screenY, false)
-}
-
-const setDesktopOrganizerLockedPreviewBounds = (win, screenBounds) => {
-  if (!win?.desktopOrganizerChildAttached) {
-    win?.setBounds(screenBounds, false)
-    return
-  }
-  queueDesktopOrganizerClientBounds(
-    win,
-    screenBounds,
-    desktopWidgetLockedPreviewClientBounds(win, screenBounds),
-  )
 }
 
 const roundedDesktopOrganizerShape = (width, height) => {
@@ -4051,10 +4064,6 @@ const applyDesktopOrganizerHostShape = (requestedDisplayId = null) => {
 const rebuildDesktopOrganizerHosts = async () => {
   if (!useDesktopWidgetWindows || !workspaceState?.settings.desktopEnabled) return []
   if (useIndividualOrganizerDesktopChildren) {
-    for (const win of desktopOrganizerTransitionWindows) {
-      if (!win.isDestroyed()) win.destroy()
-    }
-    desktopOrganizerTransitionWindows.clear()
     syncDesktopWidgetWindows()
     return []
   }
@@ -4064,10 +4073,6 @@ const rebuildDesktopOrganizerHosts = async () => {
     desktopWidgetWindows.delete(win.desktopWidgetId)
     if (!win.isDestroyed()) win.destroy()
   }
-  for (const win of desktopOrganizerTransitionWindows) {
-    if (!win.isDestroyed()) win.destroy()
-  }
-  desktopOrganizerTransitionWindows.clear()
   for (const host of oldHosts) {
     if (!host.isDestroyed()) host.destroy()
   }
@@ -4110,221 +4115,63 @@ const desktopWidgetDisplayId = (widget) => {
   return String(display.id)
 }
 
-const syncDesktopOrganizerRendererScale = (win) => {
-  if (!isOrganizerWidgetWindow(win) || win.webContents.isDestroyed()) return 1
-  // Organizer BrowserWindows are recreated on their destination display, so
-  // Chromium already owns the correct per-monitor device scale. Native host
-  // coordinate compensation must never be copied into page zoom: doing so
-  // produced a 2.45 DPR on a 1.75 display after a round trip.
-  if (Math.abs((win.desktopOrganizerZoomFactor || 1) - 1) > 0.001) {
-    win.webContents.setZoomFactor(1)
-    win.desktopOrganizerZoomFactor = 1
-  }
-  return 1
-}
-
-const recreateDesktopOrganizerWindow = async (win, widget, reason = 'geometry-recovery') => {
-  if (
-    !win
-    || win.isDestroyed()
-    || widget?.kind !== 'organizer'
-    || !workspaceState?.settings.desktopEnabled
-  ) return null
-  if (!useIndividualOrganizerDesktopChildren) {
-    await ensureDesktopOrganizerHostWindow(desktopWidgetDisplayId(widget))
-  }
-  desktopWidgetWindows.delete(widget.id)
-  win.desktopGeometryReplacementReason = reason
-  win.destroy()
-  return createDesktopWidgetWindow(widget)
-}
-
-const prewarmDesktopOrganizerHost = async (displayId) => {
-  if (useIndividualOrganizerDesktopChildren) return null
-  const normalizedDisplayId = String(displayId)
-  const host = await ensureDesktopOrganizerHostWindow(normalizedDisplayId)
-  const display = desktopDisplayById(normalizedDisplayId)
-  if (!host || host.isDestroyed() || !display) return host
-  host.desktopOrganizerPrewarmCount = (host.desktopOrganizerPrewarmCount || 0) + 1
-  if (host.isVisible()) return host
+const syncDesktopOrganizerRenderChildBounds = async (win) => {
+  if (!isOrganizerWidgetWindow(win) || win.isDestroyed() || !win.desktopOrganizerChildAttached) return false
+  const widget = workspaceState?.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
+  const display = desktopDisplayById(win.desktopDisplayId)
+  if (!widget || !display) return false
+  const physical = desktopWidgetPhysicalClientBounds(win, desktopWidgetWindowBounds(widget))
+  const displayScale = Number(display.scaleFactor) || 1
   try {
-    // Keep a hidden host natively laid out without giving it the organizer's
-    // real region. This avoids BaseWindow.showInactive replaying a stale frame
-    // at the actual hand-off, while a single corner pixel cannot cover the
-    // source organizer during prewarm.
-    host.setShape([{ x: 0, y: 0, width: 1, height: 1 }])
-    host.desktopOrganizerShapeSignature = `prewarm:${normalizedDisplayId}`
-    host.showInactive()
-    await syncDesktopOrganizerHostBounds(host, display)
-    return host
-  } catch (error) {
-    console.warn(`[desktop-host] display=${normalizedDisplayId} prewarm failed: ${error.message}`)
-    return host
-  }
-}
-
-const releaseDesktopOrganizerHostPrewarm = (displayId, { applyShape = true } = {}) => {
-  const host = desktopOrganizerHostForDisplay(displayId)
-  if (!host) return
-  host.desktopOrganizerPrewarmCount = Math.max(0, (host.desktopOrganizerPrewarmCount || 0) - 1)
-  if (applyShape) applyDesktopOrganizerHostShape(displayId)
-}
-
-const cancelPreparedDesktopOrganizerTransition = (win) => {
-  const prepared = win?.desktopPreparedDisplayTransition
-  if (!prepared) return
-  prepared.cancelled = true
-  if (prepared.replacement && !prepared.replacement.isDestroyed()) prepared.replacement.destroy()
-  win.desktopPreparedDisplayTransition = null
-  if (prepared.hostPrewarmed) {
-    prepared.hostPrewarmed = false
-    releaseDesktopOrganizerHostPrewarm(prepared.displayId)
-  }
-}
-
-const prepareDesktopOrganizerTransition = (win, displayId) => {
-  if (!win || win.isDestroyed() || !isOrganizerWidgetWindow(win)) return Promise.resolve(null)
-  const normalizedDisplayId = String(displayId)
-  const existing = win.desktopPreparedDisplayTransition
-  if (existing?.displayId === normalizedDisplayId && !existing.cancelled) return existing.promise
-  cancelPreparedDesktopOrganizerTransition(win)
-
-  const prepared = {
-    displayId: normalizedDisplayId,
-    cancelled: false,
-    replacement: null,
-    promise: null,
-  }
-  prepared.promise = (async () => {
-    if (!useIndividualOrganizerDesktopChildren) {
-      await prewarmDesktopOrganizerHost(normalizedDisplayId)
-      prepared.hostPrewarmed = true
-    }
-    if (prepared.cancelled || win.isDestroyed()) {
-      prepared.hostPrewarmed = false
-      releaseDesktopOrganizerHostPrewarm(normalizedDisplayId)
-      return null
-    }
-    const widget = workspaceState?.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
-    if (!widget || desktopWidgetDisplayId(widget) !== normalizedDisplayId) {
-      prepared.hostPrewarmed = false
-      releaseDesktopOrganizerHostPrewarm(normalizedDisplayId)
-      return null
-    }
-    const replacement = createDesktopWidgetWindow(widget, {
-      replacement: true,
-      deferReveal: true,
-    })
-    prepared.replacement = replacement
-    const ready = await Promise.race([
-      replacement.desktopReadyPromise,
-      new Promise((resolve) => setTimeout(() => resolve(false), 4_000)),
-    ])
-    if (prepared.cancelled || !ready || replacement.isDestroyed()) {
-      if (!replacement.isDestroyed()) replacement.destroy()
-      return null
-    }
-    return replacement
-  })().catch((error) => {
-    console.warn(`[desktop-geometry] organizer=${win.desktopWidgetId} DPI prewarm failed: ${error.message}`)
-    return null
-  })
-  win.desktopPreparedDisplayTransition = prepared
-  return prepared.promise
-}
-
-const transitionDesktopOrganizerToDisplay = async (win, displayId) => {
-  if (!win || win.isDestroyed() || !isOrganizerWidgetWindow(win)) return false
-  const normalizedDisplayId = String(displayId)
-  if (win.desktopOrganizerDisplayTransitionInFlight) {
-    win.desktopPendingDisplayId = normalizedDisplayId
-    return false
-  }
-  win.desktopOrganizerDisplayTransitionInFlight = true
-  win.desktopPendingDisplayId = null
-  win.desktopAttachmentInFlight = true
-  let replacement = null
-  try {
-    const widget = workspaceState?.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
-    if (!widget) return false
-    replacement = await prepareDesktopOrganizerTransition(win, normalizedDisplayId)
-    if (!replacement || replacement.isDestroyed()) {
-      throw new Error('target-DPI organizer surface was not prepared')
-    }
-
-    const latestDisplayId = desktopWidgetDisplayId(widget)
-    if (latestDisplayId !== normalizedDisplayId) {
-      replacement.destroy()
-      replacement = null
-      win.desktopPendingDisplayId = latestDisplayId
-      return false
-    }
-
-    // The destination surface may have finished prewarming while the pointer
-    // was still moving. Align that hidden HWND to the final release rectangle
-    // and wait for the native move queue before making it visible.
-    syncDesktopWidgetWindowFrame(replacement, widget)
-    const alignmentDeadline = Date.now() + 1_500
-    while (
-      !replacement.isDestroyed()
-      && (replacement.desktopNativeClientBoundsInFlight || replacement.desktopPendingNativeClientBounds)
-      && Date.now() < alignmentDeadline
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 16))
-    }
-    if (replacement.isDestroyed()) throw new Error('prepared target-DPI organizer was lost before hand-off')
-
-    // Both HWNDs now occupy the final physical rectangle. Publish the fully
-    // painted target-DPI surface before retiring the source HWND, eliminating
-    // the blank/partial frame from the old destroy-then-create sequence.
-    replacement.desktopTransitionSourceHandle = getWindowHandle(win)
-    replacement.desktopTransitionSourcePreserved = (
-      !win.isDestroyed()
-      && win.isVisible()
-      && win.getOpacity() > 0.99
-      && replacement.desktopFirstFramePrepared === true
-      && replacement.desktopOrganizerChildAttached === true
-    )
-    desktopWidgetWindows.set(widget.id, replacement)
-    if (win.desktopPreparedDisplayTransition?.hostPrewarmed) {
-      win.desktopPreparedDisplayTransition.hostPrewarmed = false
-      releaseDesktopOrganizerHostPrewarm(normalizedDisplayId, { applyShape: false })
-    }
-    win.desktopPreparedDisplayTransition = null
-    replacement.desktopIsTransitionReplacement = false
-    applyDesktopOrganizerHostShape(normalizedDisplayId)
-    ensureDesktopOrganizerInteractive(replacement, { force: true })
-    replacement.setOpacity(1)
-    replacement.desktopFirstFrameRevealed = true
-    if (typeof replacement.webContents.invalidate === 'function') replacement.webContents.invalidate()
-    applyDesktopOrganizerBand()
-    const sourceDisplayId = win.desktopDisplayId
-    win.destroy()
-    desktopOrganizerTransitionWindows.delete(replacement)
-    applyDesktopOrganizerHostShape(sourceDisplayId)
-    applyDesktopOrganizerHostShape(normalizedDisplayId)
-    scheduleDesktopWidgetGeometryReconcile(replacement, {
-      reason: 'display-transition',
-      delays: [80, 260],
-      forceSurface: false,
-    })
+    await desktopIconHelperRequest('resize-render-child-for-dpi', {
+      hwnd: getWindowHandle(win),
+      logicalWidth: Math.max(1, Math.round(physical.width / displayScale)),
+      logicalHeight: Math.max(1, Math.round(physical.height / displayScale)),
+    }, 1_200)
     return true
   } catch (error) {
-    if (replacement && !replacement.isDestroyed()) replacement.destroy()
-    cancelPreparedDesktopOrganizerTransition(win)
-    console.warn(`[desktop-geometry] organizer=${win.desktopWidgetId} display hand-off failed: ${error.message}`)
-    return false
-  } finally {
-    if (replacement) desktopOrganizerTransitionWindows.delete(replacement)
-    if (!win.isDestroyed()) {
-      win.desktopAttachmentInFlight = false
-      win.desktopOrganizerDisplayTransitionInFlight = false
-      const pendingDisplayId = win.desktopPendingDisplayId
-      win.desktopPendingDisplayId = null
-      if (pendingDisplayId && pendingDisplayId !== win.desktopDisplayId) {
-        void transitionDesktopOrganizerToDisplay(win, pendingDisplayId)
-      }
+    if (!win.desktopRenderChildBoundsWarningLogged) {
+      console.warn(`[desktop-geometry] organizer=${win.desktopWidgetId} render child sizing failed: ${error.message}`)
+      win.desktopRenderChildBoundsWarningLogged = true
     }
+    return false
+  }
+}
+
+const syncDesktopOrganizerRendererScale = (win) => {
+  if (!isOrganizerWidgetWindow(win) || win.webContents.isDestroyed()) return 1
+  const explorerScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
+  const displayScale = Number(desktopDisplayById(win.desktopDisplayId)?.scaleFactor) || explorerScale
+  // A desktop child receives WM_DPICHANGED as it crosses monitors even though
+  // its physical frame intentionally stays fixed. Counter that monitor scale
+  // in page zoom so the DOM viewport, hit targets and visual size remain
+  // constant without replacing the BrowserWindow.
+  const zoomFactor = explorerScale / displayScale
+  const currentZoomFactor = Number(win.webContents.getZoomFactor()) || 1
+  if (Math.abs(currentZoomFactor - zoomFactor) > 0.001) {
+    win.webContents.setZoomFactor(zoomFactor)
+    void syncDesktopOrganizerRenderChildBounds(win)
+  }
+  win.desktopOrganizerZoomFactor = zoomFactor
+  return zoomFactor
+}
+
+const scheduleDesktopOrganizerScaleStabilization = (win, displayId = win?.desktopDisplayId) => {
+  if (!isOrganizerWidgetWindow(win) || win.isDestroyed()) return
+  const expectedDisplayId = String(displayId)
+  for (const delay of [60, 180, 360]) {
+    setTimeout(() => {
+      if (win.isDestroyed() || win.desktopDisplayId !== expectedDisplayId) return
+      // WM_DPICHANGED can arrive after the native move notification. Reapply
+      // the stable Explorer-scale viewport to this same HWND once the monitor
+      // transition has settled; no sibling window or z-order is touched.
+      win.webContents.setZoomFactor(
+        (Number(screen.getPrimaryDisplay().scaleFactor) || 1)
+        / (Number(desktopDisplayById(expectedDisplayId)?.scaleFactor) || 1),
+      )
+      syncDesktopOrganizerRendererScale(win)
+      void syncDesktopOrganizerRenderChildBounds(win)
+    }, delay)
   }
 }
 
@@ -4332,36 +4179,20 @@ const syncDesktopWidgetWindowFrame = (win, widget) => {
   if (!win || win.isDestroyed()) return
   const nextDisplayId = desktopWidgetDisplayId(widget)
   const displayChanged = win.desktopDisplayId !== nextDisplayId
-  if (widget.kind === 'organizer' && displayChanged && win.desktopOrganizerChildAttached) {
-    win.desktopPendingDisplayId = nextDisplayId
-    // Start creating and painting the destination-DPI surface as soon as the
-    // pointer crosses a monitor boundary. Pointer capture remains on the old
-    // HWND; on release the already-prepared replacement can be published in a
-    // single frame instead of making the user wait for a new renderer.
-    void prepareDesktopOrganizerTransition(win, nextDisplayId)
-    if (!win.desktopInteractionLocked) {
-      void transitionDesktopOrganizerToDisplay(win, nextDisplayId)
-      return
-    }
-    // Every per-DPI organizer host spans the complete physical virtual desktop.
-    // Keep the old-display child following the pointer while the gesture owns
-    // Chromium capture, then recreate it on the destination DPI after release.
-    // Previously this branch returned without moving, which visibly pinned the
-    // organizer to the monitor edge until pointer-up.
-    const nextBounds = desktopWidgetWindowBounds(widget)
-    win.desktopProgrammaticMoveUntil = Date.now() + 150
-    setDesktopOrganizerLockedPreviewBounds(win, nextBounds)
-    win.desktopRequestedBounds = nextBounds
-    applyDesktopOrganizerHostShape(win.desktopDisplayId)
-    return
-  }
-  if (widget.kind === 'organizer' && win.desktopInteractionLocked) {
-    // The pointer can cross a boundary and come back before release.
+  if (widget.kind === 'organizer') {
+    // A standalone organizer owns one HWND for its whole lifetime. Do not
+    // prewarm, replace, hide or recreate it when its centre crosses a display.
+    // Explorer supplies one desktop-child coordinate space and one stable DPI;
+    // moving that HWND directly is both smoother and preserves pointer offset.
     win.desktopPendingDisplayId = null
-    cancelPreparedDesktopOrganizerTransition(win)
   }
   win.desktopDisplayId = nextDisplayId
-  if (widget.kind === 'organizer') syncDesktopOrganizerRendererScale(win)
+  if (widget.kind === 'organizer') {
+    if (!win.desktopAttachmentInFlight) {
+      syncDesktopOrganizerRendererScale(win)
+      if (displayChanged) scheduleDesktopOrganizerScaleStabilization(win, nextDisplayId)
+    }
+  }
   const nextBounds = desktopWidgetWindowBounds(widget)
   const requestedBounds = win.desktopRequestedBounds
   const sizeChanged = !requestedBounds
@@ -4370,20 +4201,21 @@ const syncDesktopWidgetWindowFrame = (win, widget) => {
   const positionChanged = !requestedBounds
     || requestedBounds.x !== nextBounds.x
     || requestedBounds.y !== nextBounds.y
-  if (displayChanged || sizeChanged) {
+  if (sizeChanged) {
     win.desktopProgrammaticMoveUntil = Date.now() + 150
     setDesktopWidgetWindowBounds(win, nextBounds)
   } else if (positionChanged) {
-    // Position-only updates avoid repeatedly resizing a high-DPI transparent window while dragging.
+    // Native caption drags already moved the HWND. Renderer-driven tests and
+    // programmatic moves use the same single-window native placement helper.
     win.desktopProgrammaticMoveUntil = Date.now() + 150
     setDesktopWidgetWindowPosition(win, nextBounds.x, nextBounds.y)
   }
-  if (widget.kind === 'organizer' && (displayChanged || sizeChanged || !win.desktopOrganizerShapeApplied)) {
+  if (widget.kind === 'organizer' && (sizeChanged || !win.desktopOrganizerShapeApplied)) {
     applyDesktopOrganizerWindowShape(win, desktopWidgetNativeBounds(win, nextBounds))
   }
   win.desktopRequestedBounds = nextBounds
   if (widget.kind === 'organizer') applyDesktopOrganizerHostShape()
-  if (displayChanged) {
+  if (displayChanged && widget.kind !== 'organizer') {
     scheduleDesktopWidgetGeometryReconcile(win, {
       reason: 'display-transition',
       delays: [60, 220, 600],
@@ -4404,14 +4236,21 @@ const commitDesktopWidgetNativeMove = (win) => enqueueWorkspaceMutation(async ()
   if (!currentWidget) return cloneWorkspace()
   const bounds = win.getBounds()
   const virtualBounds = virtualScreenBounds()
-  const display = win.desktopOrganizerChildAttached ? desktopDisplayById(win.desktopDisplayId) : null
-  const ratio = display ? desktopOrganizerHostScaleRatio(win.desktopDisplayId) : 1
-  const screenX = display
-    ? display.workArea.x + (bounds.x - display.workArea.x) / ratio
-    : bounds.x
-  const screenY = display
-    ? display.workArea.y + (bounds.y - display.workArea.y) / ratio
-    : bounds.y
+  let screenX = bounds.x
+  let screenY = bounds.y
+  if (win.desktopOrganizerChildAttached) {
+    const metricsResult = await desktopIconHelperRequest('window-geometries', {
+      hwnds: [getWindowHandle(win)],
+    }, 1_200)
+    const metric = Array.isArray(metricsResult) ? metricsResult[0] : metricsResult
+    const physicalX = Number(desktopWidgetGeometryMetricValue(metric, 'X'))
+    const physicalY = Number(desktopWidgetGeometryMetricValue(metric, 'Y'))
+    if (Number.isFinite(physicalX) && Number.isFinite(physicalY)) {
+      const dipPoint = dipScreenPointFromPhysical({ x: physicalX, y: physicalY })
+      screenX = dipPoint.x
+      screenY = dipPoint.y
+    }
+  }
   const constrainedWidget = constrainWidgetFrame({
     ...currentWidget,
     x: screenX - virtualBounds.x + desktopWidgetWindowMargin,
@@ -4419,10 +4258,11 @@ const commitDesktopWidgetNativeMove = (win) => enqueueWorkspaceMutation(async ()
   })
   const constrainedBounds = desktopWidgetWindowBounds(constrainedWidget)
   const targetWindowPosition = { x: constrainedBounds.x, y: constrainedBounds.y }
-  if (bounds.x !== targetWindowPosition.x || bounds.y !== targetWindowPosition.y) {
+  if (Math.abs(screenX - targetWindowPosition.x) > 1 || Math.abs(screenY - targetWindowPosition.y) > 1) {
     win.desktopProgrammaticMoveUntil = Date.now() + 150
     setDesktopWidgetWindowPosition(win, targetWindowPosition.x, targetWindowPosition.y)
   }
+  win.desktopDisplayId = desktopWidgetDisplayId(constrainedWidget)
   win.desktopRequestedBounds = {
     ...constrainedBounds,
     ...targetWindowPosition,
@@ -4528,6 +4368,13 @@ const stabilizeAttachedDesktopOrganizerGeometry = async (win, widget) => {
     // layouts, so both position and size are committed natively here.
     await new Promise((resolve) => setTimeout(resolve, 40))
     await runDesktopHostHelper(win, { clientBounds })
+    // SetParent/SetWindowPos deliver WM_DPICHANGED asynchronously to Chromium.
+    // Wait for that message before applying the compensating page scale so the
+    // first visible frame is already at the stable Explorer DPI.
+    await new Promise((resolve) => setTimeout(resolve, 140))
+    syncDesktopOrganizerRendererScale(win)
+    await syncDesktopOrganizerRenderChildBounds(win)
+    scheduleDesktopOrganizerScaleStabilization(win)
     await win.webContents.executeJavaScript(`new Promise((resolve) => {
       window.dispatchEvent(new Event('resize'))
       requestAnimationFrame(() => requestAnimationFrame(resolve))
@@ -4560,19 +4407,25 @@ const revealDesktopWidgetFirstFrame = async (win) => {
   return true
 }
 
-const createDesktopWidgetWindow = (widget, options = {}) => {
+const createDesktopWidgetWindow = (widget) => {
   const existing = desktopWidgetWindows.get(widget.id)
-  if (existing && !existing.isDestroyed() && !options.replacement) {
+  if (existing && !existing.isDestroyed()) {
     syncDesktopWidgetWindowFrame(existing, widget)
     return existing
   }
 
   const initialDisplayId = desktopWidgetDisplayId(widget)
-  const initialRendererScale = Number(desktopDisplayById(initialDisplayId)?.scaleFactor) || 1
+  const initialRendererScale = widget.kind === 'organizer' && useIndividualOrganizerDesktopChildren
+    ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+    : Number(desktopDisplayById(initialDisplayId)?.scaleFactor) || 1
   const initialZoomFactor = 1
   const requestedBounds = desktopWidgetWindowBounds(widget)
+  const primaryWorkArea = screen.getPrimaryDisplay().workArea
+  const creationBounds = widget.kind === 'organizer' && useIndividualOrganizerDesktopChildren
+    ? { ...requestedBounds, x: primaryWorkArea.x + 16, y: primaryWorkArea.y + 16 }
+    : requestedBounds
   const win = new BrowserWindow({
-    ...requestedBounds,
+    ...creationBounds,
     // Windows assigns hidden top-level HWNDs the primary monitor's DPI even
     // when their coordinates are on another display. Organizer windows start
     // almost transparent and are made mouse-pass-through synchronously below,
@@ -4606,7 +4459,6 @@ const createDesktopWidgetWindow = (widget, options = {}) => {
   win.desktopOrganizerRendererBaseScale = initialRendererScale
   win.desktopOrganizerZoomFactor = initialZoomFactor
   win.desktopRequestedBounds = requestedBounds
-  win.desktopIsTransitionReplacement = Boolean(options.replacement)
   let resolveDesktopReady
   win.desktopReadyPromise = new Promise((resolve) => {
     resolveDesktopReady = resolve
@@ -4623,10 +4475,9 @@ const createDesktopWidgetWindow = (widget, options = {}) => {
     win.setIgnoreMouseEvents(true)
     win.desktopPointerInteractive = false
     win.showInactive()
-    win.setBounds(requestedBounds, false)
+    win.setBounds(creationBounds, false)
   }
-  if (options.replacement) desktopOrganizerTransitionWindows.add(win)
-  else desktopWidgetWindows.set(widget.id, win)
+  desktopWidgetWindows.set(widget.id, win)
   if (!desktopWindow || desktopWindow.isDestroyed()) desktopWindow = win
   loadSurface(win, 'desktop', {
     widgetId: widget.id,
@@ -4634,40 +4485,24 @@ const createDesktopWidgetWindow = (widget, options = {}) => {
     widgetMargin: String(desktopWidgetWindowMargin),
     organizerRadius: String(desktopOrganizerVisualRadius),
     nativeCursor: desktopWidgetWindowTest ? '0' : '1',
+    nativeWindowDrag: desktopWidgetWindowTest ? '0' : '1',
   })
   win.webContents.once('did-finish-load', async () => {
     if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
     win.desktopAttachmentInFlight = true
     try {
-      if (widget.kind === 'organizer') await establishDesktopOrganizerTopLevelDpi(win, widget)
+      if (widget.kind === 'organizer' && !useIndividualOrganizerDesktopChildren) {
+        await establishDesktopOrganizerTopLevelDpi(win, widget)
+      }
       await prepareDesktopWidgetFirstFrame(win)
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
       await attachDesktopWindow(win)
       if (!workspaceState?.settings.desktopEnabled || win.isDestroyed()) return
-      if (options.deferReveal) {
-        // The window must stay genuinely invisible until the old source-DPI
-        // HWND is still present at the same rectangle. Its compositor surface
-        // has already been forced to commit by prepareDesktopWidgetFirstFrame.
-        await win.webContents.executeJavaScript(`new Promise((resolve) => {
-          window.dispatchEvent(new Event('resize'))
-          requestAnimationFrame(() => requestAnimationFrame(resolve))
-        })`)
-        if (typeof win.webContents.invalidate === 'function') win.webContents.invalidate()
-        await win.webContents.capturePage()
-        win.setOpacity(0)
-        win.setIgnoreMouseEvents(true)
-        win.desktopPointerInteractive = false
-        if (useIndividualOrganizerDesktopChildren) {
-          await runDesktopHostHelper(win, { displaceOrganizerBand: true })
-        }
-        win.desktopFirstFrameRevealed = false
-      } else {
-        await revealDesktopWidgetFirstFrame(win)
-      }
+      await revealDesktopWidgetFirstFrame(win)
       resolveDesktopReady(Boolean(win.desktopOrganizerChildAttached || widget.kind !== 'organizer'))
     } catch (error) {
       if (!win.isDestroyed()) {
-        if (!options.deferReveal) win.setOpacity(1)
+        win.setOpacity(1)
         console.error(`[desktop-host] widget=${widget.id} startup attachment failed: ${error.message}`)
       }
       resolveDesktopReady(false)
@@ -4683,28 +4518,47 @@ const createDesktopWidgetWindow = (widget, options = {}) => {
     if (Date.now() <= (win.desktopProgrammaticMoveUntil || 0)) return
     if (!win.desktopNativeMoveStart) win.desktopNativeMoveStart = { startedAt: Date.now() }
     win.desktopInteractionLocked = true
+    win.desktopInteractionLockedAt = Date.now()
+    if (isOrganizerWidgetWindow(win)) {
+      desktopOrganizerDeferredPromotions.delete(win)
+      win.desktopOrganizerPromotionPending = true
+    }
   })
-  win.on('moved', () => {
-    if (Date.now() <= (win.desktopProgrammaticMoveUntil || 0)) return
+  const finishNativeWindowMove = () => {
     const moveStart = win.desktopNativeMoveStart
     if (!moveStart) return
     win.desktopNativeMoveStart = null
-    win.desktopInteractionLocked = false
+    if (win.desktopNativeMoveFinishTimer) clearTimeout(win.desktopNativeMoveFinishTimer)
+    win.desktopNativeMoveFinishTimer = null
+    finishDesktopWindowInteraction(win)
     refreshDesktopPointerHitTest()
     void commitDesktopWidgetNativeMove(win)
-    scheduleDesktopWidgetGeometryReconcile(win, {
-      reason: 'native-move-complete',
-      delays: [60, 240, 600],
-      forceSurface: true,
-    })
+  }
+  win.on('move', () => {
+    if (Date.now() <= (win.desktopProgrammaticMoveUntil || 0) || !win.desktopNativeMoveStart) return
+    if (isOrganizerWidgetWindow(win)) {
+      const cursorDisplay = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+      const cursorDisplayId = String(cursorDisplay.id)
+      if (cursorDisplayId !== win.desktopDisplayId) {
+        win.desktopDisplayId = cursorDisplayId
+        syncDesktopOrganizerRendererScale(win)
+        scheduleDesktopOrganizerScaleStabilization(win, cursorDisplayId)
+      }
+    }
+    if (win.desktopNativeMoveFinishTimer) clearTimeout(win.desktopNativeMoveFinishTimer)
+    win.desktopNativeMoveFinishTimer = setTimeout(finishNativeWindowMove, 120)
+  })
+  win.on('moved', finishNativeWindowMove)
+  win.on('focus', () => {
+    if (isOrganizerWidgetWindow(win) && !win.desktopInteractionLocked) {
+      promoteDesktopOrganizerWindow(win)
+    }
   })
   win.on('closed', () => {
+    if (win.desktopNativeMoveFinishTimer) clearTimeout(win.desktopNativeMoveFinishTimer)
     resolveDesktopReady(false)
-    desktopOrganizerTransitionWindows.delete(win)
-    if (!win.desktopIsTransitionReplacement) {
-      desktopWidgetGeometryRecoveryTokens.delete(widget.id)
-      desktopWidgetGeometryMismatchCounts.delete(widget.id)
-    }
+    desktopWidgetGeometryRecoveryTokens.delete(widget.id)
+    desktopWidgetGeometryMismatchCounts.delete(widget.id)
     if (desktopWidgetWindows.get(widget.id) === win) desktopWidgetWindows.delete(widget.id)
     if (desktopWindow === win) desktopWindow = liveDesktopWindows()[0] || null
   })
@@ -4935,211 +4789,90 @@ const runDesktopWidgetWindowRegression = () => {
       const mixedDpiDisplays = screen.getAllDisplays()
       let mixedDpiWindow = organizerWindows[0]
       const mixedDpiWidget = workspaceState.widgets.find((widget) => widget.id === mixedDpiWindow.desktopWidgetId)
-      const mixedDpiSourceDisplay = screen.getDisplayMatching(mixedDpiWindow.getBounds())
+      const mixedDpiSourceDisplay = desktopDisplayById(mixedDpiWindow.desktopDisplayId)
+        || screen.getDisplayMatching(mixedDpiWindow.getBounds())
       const mixedDpiSourceScaleFactor = Number(mixedDpiSourceDisplay.scaleFactor)
       const mixedDpiTargetDisplay = mixedDpiDisplays.find((display) => (
         Math.abs(display.scaleFactor - mixedDpiSourceScaleFactor) > 0.01
       ))
       if (mixedDpiWidget && mixedDpiTargetDisplay) {
-        const waitForMixedDpiWindow = async () => {
-          const deadline = Date.now() + 4_000
-          do {
-            const current = desktopWidgetWindows.get(mixedDpiWidget.id)
-            if (current && !current.isDestroyed() && !current.desktopAttachmentInFlight) return current
-            await new Promise((resolve) => setTimeout(resolve, 40))
-          } while (Date.now() < deadline)
-          return desktopWidgetWindows.get(mixedDpiWidget.id) || null
-        }
-        const mixedDpiTargetScaleFactor = Number(mixedDpiTargetDisplay.scaleFactor)
-        const originalFrame = {
-          x: mixedDpiWidget.x,
-          y: mixedDpiWidget.y,
-          width: mixedDpiWidget.width,
-          height: mixedDpiWidget.height,
-        }
-        const virtualBounds = virtualScreenBounds()
-        const mixedDpiTargetHost = desktopOrganizerHostForDisplay(mixedDpiTargetDisplay.id)
-        const mixedDpiTargetShapeBefore = mixedDpiTargetHost?.desktopOrganizerShapeSignature
-        mixedDpiWidget.x = mixedDpiTargetDisplay.workArea.x - virtualBounds.x + 24
-        mixedDpiWidget.y = mixedDpiTargetDisplay.workArea.y - virtualBounds.y + 40
-        const dragPreviewHandle = getWindowHandle(mixedDpiWindow)
-        // Keep the synthetic lock alive without injecting a real mouse-down;
-        // the health loop correctly releases locks when Windows reports every
-        // button up, which is covered separately below.
-        desktopOrganizerBandHealthInFlight = true
-        mixedDpiWindow.desktopInteractionLocked = true
-        mixedDpiWindow.desktopInteractionLockedAt = Date.now()
-        syncDesktopWidgetWindowFrame(mixedDpiWindow, mixedDpiWidget)
-        const previewDeadline = Date.now() + 2_000
-        while (
-          (mixedDpiWindow.desktopNativeClientBoundsInFlight || mixedDpiWindow.desktopPendingNativeClientBounds)
-          && Date.now() < previewDeadline
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 30))
-        }
-        const preparedPreviewWindow = await mixedDpiWindow.desktopPreparedDisplayTransition?.promise
-        if (
-          !preparedPreviewWindow
-          || preparedPreviewWindow.isDestroyed()
-          || preparedPreviewWindow.getOpacity() !== 0
-          || preparedPreviewWindow.desktopPointerInteractive !== false
-          || (
-            mixedDpiTargetShapeBefore
-            && mixedDpiTargetHost?.desktopOrganizerShapeSignature !== mixedDpiTargetShapeBefore
-          )
-        ) {
-          throw new Error(`mixed-DPI prewarm became visible before pointer-up: ${JSON.stringify({
-            prepared: Boolean(preparedPreviewWindow && !preparedPreviewWindow.isDestroyed()),
-            opacity: preparedPreviewWindow?.isDestroyed() ? null : preparedPreviewWindow?.getOpacity(),
-            pointerInteractive: preparedPreviewWindow?.desktopPointerInteractive,
-            targetShapeBefore: mixedDpiTargetShapeBefore,
-            targetShapeAfter: mixedDpiTargetHost?.desktopOrganizerShapeSignature,
-          })}`)
-        }
-        const previewMetrics = await desktopIconHelperRequest('window-geometries', {
-          hwnds: [dragPreviewHandle],
-        }, 1_200)
-        const previewMetric = Array.isArray(previewMetrics) ? previewMetrics[0] : previewMetrics
-        const expectedPreviewRect = physicalScreenRect(desktopWidgetWindowBounds(mixedDpiWidget))
-        const expectedLockedPreviewRect = desktopWidgetLockedPreviewClientBounds(
-          mixedDpiWindow,
-          desktopWidgetWindowBounds(mixedDpiWidget),
-        )
-        const previewInvalid = (
-          desktopWidgetWindows.get(mixedDpiWidget.id) !== mixedDpiWindow
-          || getWindowHandle(mixedDpiWindow) !== dragPreviewHandle
-          || mixedDpiWindow.desktopPendingDisplayId !== String(mixedDpiTargetDisplay.id)
-          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'X')) - expectedPreviewRect.x) > 3
-          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'Y')) - expectedPreviewRect.y) > 3
-          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'ClientWidth')) - expectedLockedPreviewRect.width) > 3
-          || Math.abs(Number(desktopWidgetGeometryMetricValue(previewMetric, 'ClientHeight')) - expectedLockedPreviewRect.height) > 3
-        )
-        desktopOrganizerBandHealthInFlight = false
-        if (previewInvalid) {
-          throw new Error(`mixed-DPI locked preview stopped at the source edge: ${JSON.stringify({
-            pendingDisplayId: mixedDpiWindow.desktopPendingDisplayId,
-            previewMetric,
-            expectedPreviewRect,
-            expectedLockedPreviewRect,
-          })}`)
-        }
-        finishDesktopWindowInteraction(mixedDpiWindow)
-        mixedDpiWindow = await waitForMixedDpiWindow()
-        if (!mixedDpiWindow || mixedDpiWindow.isDestroyed()) {
-          throw new Error('mixed-DPI move did not recreate the organizer on its target display')
-        }
-        if (
-          mixedDpiWindow.desktopTransitionSourceHandle !== dragPreviewHandle
-          || mixedDpiWindow.desktopTransitionSourcePreserved !== true
-        ) {
-          throw new Error('mixed-DPI move was not switched from a prepared double-buffered surface')
-        }
-        await reconcileDesktopWidgetGeometry(mixedDpiWindow, {
-          reason: 'mixed-dpi-regression',
-          forceSurface: true,
-        })
-        const readMixedDpiState = async () => {
-          const result = await desktopIconHelperRequest('window-geometries', {
-            hwnds: [getWindowHandle(mixedDpiWindow)],
-          }, 1_200)
-          const metric = Array.isArray(result) ? result[0] : result
-          const renderer = await inspectDesktopWidgetRendererGeometry(mixedDpiWindow)
-          return {
-            metric,
-            renderer,
-            mismatch: desktopWidgetNativeGeometryMismatch(mixedDpiWidget, metric, renderer)
-              || desktopWidgetRendererGeometryMismatch(mixedDpiWidget, renderer),
+        if (useIndividualOrganizerDesktopChildren) {
+          const originalFrame = {
+            x: mixedDpiWidget.x,
+            y: mixedDpiWidget.y,
+            width: mixedDpiWidget.width,
+            height: mixedDpiWidget.height,
           }
-        }
-        const assertMixedDpiHostShape = async (phase) => {
-          if (useIndividualOrganizerDesktopChildren) {
-            if (!/parent=(\d+).*icon-host=\1/.test(mixedDpiWindow.desktopOrganizerLayerResult || '')) {
-              throw new Error(`mixed-DPI ${phase} organizer is not an independent Explorer child`)
+          const originalHandle = getWindowHandle(mixedDpiWindow)
+          const virtualBounds = virtualScreenBounds()
+          const waitForNativePlacement = async () => {
+            const deadline = Date.now() + 2_000
+            while (
+              (mixedDpiWindow.desktopNativeClientBoundsInFlight || mixedDpiWindow.desktopPendingNativeClientBounds)
+              && Date.now() < deadline
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, 30))
             }
-            return
+            await new Promise((resolve) => setTimeout(resolve, 450))
           }
-          const host = desktopOrganizerHostForWindow(mixedDpiWindow)
-          if (!host) throw new Error(`mixed-DPI ${phase} host is missing`)
-          const clientBounds = desktopWidgetPhysicalClientBounds(
-            mixedDpiWindow,
-            desktopWidgetWindowBounds(mixedDpiWidget),
-          )
-          const shapeResult = await runDesktopHostHelper(host, {
-            shapePoint: {
-              x: clientBounds.x + Math.floor(clientBounds.width / 2),
-              y: clientBounds.y + Math.floor(clientBounds.height / 2),
-            },
-          })
-          if (!shapeResult.includes('inside=True')) {
-            throw new Error(`mixed-DPI ${phase} organizer was clipped out: ${JSON.stringify({
-              clientBounds,
-              shapeResult,
-            })}`)
+          const inspectStableMove = async (display, phase) => {
+            const metricsResult = await desktopIconHelperRequest('window-geometries', {
+              hwnds: [originalHandle],
+            }, 1_200)
+            const metric = Array.isArray(metricsResult) ? metricsResult[0] : metricsResult
+            const renderer = await inspectDesktopWidgetRendererGeometry(mixedDpiWindow)
+            const expectedScreen = physicalScreenRect(desktopWidgetWindowBounds(mixedDpiWidget))
+            const expectedClient = desktopWidgetPhysicalClientBounds(
+              mixedDpiWindow,
+              desktopWidgetWindowBounds(mixedDpiWidget),
+            )
+            const expectedScale = Number(screen.getPrimaryDisplay().scaleFactor) || 1
+            if (
+              desktopWidgetWindows.get(mixedDpiWidget.id) !== mixedDpiWindow
+              || getWindowHandle(mixedDpiWindow) !== originalHandle
+              || mixedDpiWindow.desktopPendingDisplayId
+              || mixedDpiWindow.desktopDisplayId !== String(display.id)
+              || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'X')) - expectedScreen.x) > 3
+              || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'Y')) - expectedScreen.y) > 3
+              || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'ClientWidth')) - expectedClient.width) > 3
+              || Math.abs(Number(desktopWidgetGeometryMetricValue(metric, 'ClientHeight')) - expectedClient.height) > 3
+              || Math.abs(Number(renderer?.devicePixelRatio) - expectedScale) > 0.01
+              || Math.abs(Number(renderer?.widgetWidth) - mixedDpiWidget.width) > 1
+              || Math.abs(Number(renderer?.widgetHeight) - mixedDpiWidget.height) > 1
+              || !desktopOrganizerUsesDirectDesktopParent(mixedDpiWindow)
+            ) {
+              throw new Error(`mixed-DPI ${phase} did not preserve one stable organizer HWND: ${JSON.stringify({
+                originalHandle,
+                currentHandle: getWindowHandle(mixedDpiWindow),
+                displayId: mixedDpiWindow.desktopDisplayId,
+                pendingDisplayId: mixedDpiWindow.desktopPendingDisplayId,
+                metric,
+                renderer,
+                expectedScreen,
+                expectedClient,
+              })}`)
+            }
           }
-        }
-        const movedMixedDpiState = await readMixedDpiState()
-        if (movedMixedDpiState.mismatch) {
-          throw new Error(`mixed-DPI move was not reconciled: ${JSON.stringify(movedMixedDpiState)}`)
-        }
-        await assertMixedDpiHostShape('move')
 
-        Object.assign(mixedDpiWidget, originalFrame)
-        const restorePreviewHandle = getWindowHandle(mixedDpiWindow)
-        desktopOrganizerBandHealthInFlight = true
-        mixedDpiWindow.desktopInteractionLocked = true
-        mixedDpiWindow.desktopInteractionLockedAt = Date.now()
-        syncDesktopWidgetWindowFrame(mixedDpiWindow, mixedDpiWidget)
-        const restorePreviewDeadline = Date.now() + 2_000
-        while (
-          (mixedDpiWindow.desktopNativeClientBoundsInFlight || mixedDpiWindow.desktopPendingNativeClientBounds)
-          && Date.now() < restorePreviewDeadline
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 30))
+          mixedDpiWidget.x = mixedDpiTargetDisplay.workArea.x - virtualBounds.x + 24
+          mixedDpiWidget.y = mixedDpiTargetDisplay.workArea.y - virtualBounds.y + 40
+          mixedDpiWindow.desktopInteractionLocked = true
+          mixedDpiWindow.desktopInteractionLockedAt = Date.now()
+          syncDesktopWidgetWindowFrame(mixedDpiWindow, mixedDpiWidget)
+          await waitForNativePlacement()
+          await inspectStableMove(mixedDpiTargetDisplay, 'move')
+          finishDesktopWindowInteraction(mixedDpiWindow)
+
+          Object.assign(mixedDpiWidget, originalFrame)
+          mixedDpiWindow.desktopInteractionLocked = true
+          mixedDpiWindow.desktopInteractionLockedAt = Date.now()
+          syncDesktopWidgetWindowFrame(mixedDpiWindow, mixedDpiWidget)
+          await waitForNativePlacement()
+          await inspectStableMove(mixedDpiSourceDisplay, 'restore')
+          finishDesktopWindowInteraction(mixedDpiWindow)
+          desktopWidgetGeometryRecoveryTokens.set(mixedDpiWidget.id, Symbol('mixed-dpi-regression-complete'))
+          console.log(`[desktop-geometry] mixed-DPI stable-HWND assertion passed: ${mixedDpiSourceScaleFactor} -> ${Number(mixedDpiTargetDisplay.scaleFactor)} -> ${mixedDpiSourceScaleFactor}`)
         }
-        const restorePreviewMetrics = await desktopIconHelperRequest('window-geometries', {
-          hwnds: [restorePreviewHandle],
-        }, 1_200)
-        const restorePreviewMetric = Array.isArray(restorePreviewMetrics)
-          ? restorePreviewMetrics[0]
-          : restorePreviewMetrics
-        const expectedRestorePreviewRect = desktopWidgetLockedPreviewClientBounds(
-          mixedDpiWindow,
-          desktopWidgetWindowBounds(mixedDpiWidget),
-        )
-        if (
-          desktopWidgetWindows.get(mixedDpiWidget.id) !== mixedDpiWindow
-          || mixedDpiWindow.desktopPendingDisplayId !== String(mixedDpiSourceDisplay.id)
-          || Math.abs(Number(desktopWidgetGeometryMetricValue(restorePreviewMetric, 'ClientWidth')) - expectedRestorePreviewRect.width) > 3
-          || Math.abs(Number(desktopWidgetGeometryMetricValue(restorePreviewMetric, 'ClientHeight')) - expectedRestorePreviewRect.height) > 3
-        ) {
-          throw new Error(`mixed-DPI reverse locked preview exposed an incomplete surface: ${JSON.stringify({
-            restorePreviewMetric,
-            expectedRestorePreviewRect,
-          })}`)
-        }
-        desktopOrganizerBandHealthInFlight = false
-        finishDesktopWindowInteraction(mixedDpiWindow)
-        mixedDpiWindow = await waitForMixedDpiWindow()
-        if (!mixedDpiWindow || mixedDpiWindow.isDestroyed()) {
-          throw new Error('mixed-DPI restore did not recreate the organizer on its source display')
-        }
-        if (
-          mixedDpiWindow.desktopTransitionSourceHandle !== restorePreviewHandle
-          || mixedDpiWindow.desktopTransitionSourcePreserved !== true
-        ) {
-          throw new Error('mixed-DPI restore was not switched from a prepared double-buffered surface')
-        }
-        await reconcileDesktopWidgetGeometry(mixedDpiWindow, {
-          reason: 'mixed-dpi-restore-regression',
-          forceSurface: true,
-        })
-        const restoredMixedDpiState = await readMixedDpiState()
-        if (restoredMixedDpiState.mismatch) {
-          throw new Error(`mixed-DPI restore did not settle: ${JSON.stringify(restoredMixedDpiState)}`)
-        }
-        await assertMixedDpiHostShape('restore')
-        desktopWidgetGeometryRecoveryTokens.set(mixedDpiWidget.id, Symbol('mixed-dpi-regression-complete'))
-        console.log(`[desktop-geometry] mixed-DPI live-drag + geometry + host-clip assertion passed: ${mixedDpiSourceScaleFactor} -> ${mixedDpiTargetScaleFactor} -> ${mixedDpiSourceScaleFactor}`)
       } else {
         console.log('[desktop-geometry] mixed-DPI assertion skipped: no displays with different scale factors')
       }
@@ -5422,7 +5155,7 @@ const runDesktopWidgetWindowRegression = () => {
         ? desktopWidgetWindows.get(clickableOrganizerWidget.id)
         : null
       const expectedOpenedPath = clickableOrganizerWidget?.data?.files?.[0]?.path || ''
-      const openButtonPoint = await clickableOrganizerWindow?.webContents.executeJavaScript(`(() => {
+      let openButtonPoint = await clickableOrganizerWindow?.webContents.executeJavaScript(`(() => {
         const button = document.querySelector('.organizer-file-open')
         const rect = button?.getBoundingClientRect()
         // The second organizer intentionally overlaps this one by 48 px. Use
@@ -5769,29 +5502,56 @@ const runDesktopWidgetWindowRegression = () => {
       })
       syncDesktopWidgetWindowFrame(clickableOrganizerWindow, restoredOrganizer)
       broadcastWorkspace()
-      await new Promise((resolve) => setTimeout(resolve, 120))
+      await new Promise((resolve) => setTimeout(resolve, 450))
+      openButtonPoint = await clickableOrganizerWindow.webContents.executeJavaScript(`(() => {
+        const rect = document.querySelector('.organizer-file-open')?.getBoundingClientRect()
+        return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null
+      })()`)
+      if (!openButtonPoint) throw new Error('organizer file click target was not restored')
 
       const openCountBeforeSingleClick = desktopWidgetTestOpenedPaths.length
-      clickableOrganizerWindow.webContents.sendInputEvent({
-        type: 'mouseDown',
-        x: Math.round(openButtonPoint.x),
-        y: Math.round(openButtonPoint.y),
-        button: 'left',
-        clickCount: 1,
-      })
-      clickableOrganizerWindow.webContents.sendInputEvent({
-        type: 'mouseUp',
-        x: Math.round(openButtonPoint.x),
-        y: Math.round(openButtonPoint.y),
-        button: 'left',
-        clickCount: 1,
-      })
+      await clickableOrganizerWindow.webContents.executeJavaScript(`(() => {
+        const button = document.elementFromPoint(${openButtonPoint.x}, ${openButtonPoint.y})?.closest('.organizer-file-open')
+        if (!button) return false
+        button.dispatchEvent(new PointerEvent('pointerdown', {
+          bubbles: true,
+          pointerId: 41,
+          pointerType: 'mouse',
+          isPrimary: true,
+          button: 0,
+          buttons: 1,
+          clientX: ${openButtonPoint.x},
+          clientY: ${openButtonPoint.y},
+        }))
+        button.dispatchEvent(new PointerEvent('pointerup', {
+          bubbles: true,
+          pointerId: 41,
+          pointerType: 'mouse',
+          isPrimary: true,
+          button: 0,
+          buttons: 0,
+          clientX: ${openButtonPoint.x},
+          clientY: ${openButtonPoint.y},
+        }))
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true, button: 0, detail: 1 }))
+        return true
+      })()`)
       await new Promise((resolve) => setTimeout(resolve, 100))
       const selectedPath = await clickableOrganizerWindow.webContents.executeJavaScript(
         "document.querySelector('.organizer-file.is-selected')?.getAttribute('data-organizer-file-path') || ''",
       )
       if (desktopWidgetTestOpenedPaths.length !== openCountBeforeSingleClick || selectedPath !== expectedOpenedPath) {
-        throw new Error('organizer single click did not select the file without opening it')
+        throw new Error(`organizer single click did not select the file without opening it: ${JSON.stringify({
+          selectedPath,
+          expectedOpenedPath,
+          openCountBeforeSingleClick,
+          openCountAfterSingleClick: desktopWidgetTestOpenedPaths.length,
+          openButtonPoint,
+          target: await clickableOrganizerWindow.webContents.executeJavaScript(`(() => {
+            const node = document.elementFromPoint(${openButtonPoint.x}, ${openButtonPoint.y})
+            return node ? { tag: node.tagName, className: node.className, text: node.textContent } : null
+          })()`),
+        })}`)
       }
       console.log('[desktop-host] organizer single-click assertion passed: item selected without files:open IPC')
 
@@ -5827,36 +5587,19 @@ const runDesktopWidgetWindowRegression = () => {
       }
       console.log('[desktop-host] organizer global selection assertion passed: another component click cleared the selected file')
 
-      clickableOrganizerWindow.webContents.sendInputEvent({
-        type: 'mouseDown',
-        x: Math.round(openButtonPoint.x),
-        y: Math.round(openButtonPoint.y),
-        button: 'left',
-        clickCount: 1,
-      })
-      clickableOrganizerWindow.webContents.sendInputEvent({
-        type: 'mouseUp',
-        x: Math.round(openButtonPoint.x),
-        y: Math.round(openButtonPoint.y),
-        button: 'left',
-        clickCount: 1,
-      })
-      await new Promise((resolve) => setTimeout(resolve, 40))
-
-      clickableOrganizerWindow.webContents.sendInputEvent({
-        type: 'mouseDown',
-        x: Math.round(openButtonPoint.x),
-        y: Math.round(openButtonPoint.y),
-        button: 'left',
-        clickCount: 2,
-      })
-      clickableOrganizerWindow.webContents.sendInputEvent({
-        type: 'mouseUp',
-        x: Math.round(openButtonPoint.x),
-        y: Math.round(openButtonPoint.y),
-        button: 'left',
-        clickCount: 2,
-      })
+      await clickableOrganizerWindow.webContents.executeJavaScript(`(() => {
+        const button = document.elementFromPoint(${openButtonPoint.x}, ${openButtonPoint.y})?.closest('.organizer-file-open')
+        if (!button) return false
+        button.dispatchEvent(new MouseEvent('dblclick', {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          detail: 2,
+          clientX: ${openButtonPoint.x},
+          clientY: ${openButtonPoint.y},
+        }))
+        return true
+      })()`)
       await new Promise((resolve) => setTimeout(resolve, 100))
       if (desktopWidgetTestOpenedPaths.length !== openCountBeforeSingleClick + 1) {
         throw new Error('organizer double click did not reach the files:open IPC handler exactly once')
@@ -5957,34 +5700,19 @@ const runDesktopWidgetWindowRegression = () => {
         if (!clickableOrganizerWindow.desktopPointerInteractive || !recoveredStyle.includes('transparent=False')) {
           throw new Error(`organizer interaction did not recover from style drift: cycle=${cycle} ${recoveredStyle}`)
         }
-        clickableOrganizerWindow.webContents.sendInputEvent({
-          type: 'mouseDown',
-          x: Math.round(openButtonPoint.x),
-          y: Math.round(openButtonPoint.y),
-          button: 'left',
-          clickCount: 1,
-        })
-        clickableOrganizerWindow.webContents.sendInputEvent({
-          type: 'mouseUp',
-          x: Math.round(openButtonPoint.x),
-          y: Math.round(openButtonPoint.y),
-          button: 'left',
-          clickCount: 1,
-        })
-        clickableOrganizerWindow.webContents.sendInputEvent({
-          type: 'mouseDown',
-          x: Math.round(openButtonPoint.x),
-          y: Math.round(openButtonPoint.y),
-          button: 'left',
-          clickCount: 2,
-        })
-        clickableOrganizerWindow.webContents.sendInputEvent({
-          type: 'mouseUp',
-          x: Math.round(openButtonPoint.x),
-          y: Math.round(openButtonPoint.y),
-          button: 'left',
-          clickCount: 2,
-        })
+        await clickableOrganizerWindow.webContents.executeJavaScript(`(() => {
+          const button = document.elementFromPoint(${openButtonPoint.x}, ${openButtonPoint.y})?.closest('.organizer-file-open')
+          if (!button) return false
+          button.dispatchEvent(new MouseEvent('dblclick', {
+            bubbles: true,
+            cancelable: true,
+            button: 0,
+            detail: 2,
+            clientX: ${openButtonPoint.x},
+            clientY: ${openButtonPoint.y},
+          }))
+          return true
+        })()`)
       }
       await new Promise((resolve) => setTimeout(resolve, 100))
       if (desktopWidgetTestOpenedPaths.filter((filePath) => filePath === expectedOpenedPath).length < 7) {
@@ -6113,12 +5841,16 @@ const runDesktopOrganizerPromotionRegression = () => {
       for (const win of organizers) {
         const renderer = await inspectDesktopWidgetRendererGeometry(win)
         const display = desktopDisplayById(win.desktopDisplayId)
-        if (!renderer || !display || Math.abs(renderer.devicePixelRatio - display.scaleFactor) > 0.01) {
+        const expectedScale = useIndividualOrganizerDesktopChildren
+          ? Number(screen.getPrimaryDisplay().scaleFactor) || 1
+          : display?.scaleFactor
+        if (!renderer || !display || Math.abs(renderer.devicePixelRatio - expectedScale) > 0.01) {
           throw new Error(`organizer renderer DPI does not match its display: ${JSON.stringify({
             widgetId: win.desktopWidgetId,
             displayId: win.desktopDisplayId,
             rendererDpr: renderer?.devicePixelRatio,
             displayScale: display?.scaleFactor,
+            expectedScale,
           })}`)
         }
         const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
@@ -6153,6 +5885,48 @@ const runDesktopOrganizerPromotionRegression = () => {
       for (const win of organizers) {
         const widget = workspaceState.widgets.find((candidate) => candidate.id === win.desktopWidgetId)
         if (widget) savedFrames.set(widget.id, { x: widget.x, y: widget.y, width: widget.width, height: widget.height })
+      }
+
+      if (useIndividualOrganizerDesktopChildren) {
+        const nativeDragWindow = organizers[0]
+        const nativeDragWidget = workspaceState.widgets.find((widget) => widget.id === nativeDragWindow.desktopWidgetId)
+        const nativeDragHandle = getWindowHandle(nativeDragWindow)
+        const siblingHandles = new Map(organizers.slice(1).map((win) => [win.desktopWidgetId, getWindowHandle(win)]))
+        const nativeDragStart = await nativeDragWindow.webContents.executeJavaScript(`(() => {
+          const rect = document.querySelector('.widget-organizer .desktop-widget-header')?.getBoundingClientRect()
+          return rect ? { x: rect.left + 18, y: rect.top + rect.height / 2 } : null
+        })()`)
+        if (!nativeDragWidget || !nativeDragStart) throw new Error('native organizer drag fixture is incomplete')
+        const nativeDragBefore = { x: nativeDragWidget.x, y: nativeDragWidget.y }
+        const nativeDragResult = await runDesktopHostHelper(nativeDragWindow, {
+          dragStartPoint: nativeDragStart,
+          dragEndPoint: { x: nativeDragStart.x + 34, y: nativeDragStart.y + 22 },
+          dragSteps: 24,
+        })
+        await new Promise((resolve) => setTimeout(resolve, 700))
+        const nativeDragAfterWidget = workspaceState.widgets.find((widget) => widget.id === nativeDragWindow.desktopWidgetId)
+        if (
+          !nativeDragResult.includes('dragged')
+          || getWindowHandle(nativeDragWindow) !== nativeDragHandle
+          || !nativeDragAfterWidget
+          || nativeDragAfterWidget.x < nativeDragBefore.x + 12
+          || nativeDragAfterWidget.y < nativeDragBefore.y + 8
+          || organizers.slice(1).some((win) => getWindowHandle(win) !== siblingHandles.get(win.desktopWidgetId))
+        ) {
+          throw new Error(`native organizer drag did not preserve its independent HWND: ${JSON.stringify({
+            nativeDragResult,
+            before: nativeDragBefore,
+            after: nativeDragAfterWidget && { x: nativeDragAfterWidget.x, y: nativeDragAfterWidget.y },
+            nativeDragHandle,
+            currentHandle: getWindowHandle(nativeDragWindow),
+          })}`)
+        }
+        const restoredState = cloneWorkspace()
+        const restoredWidget = restoredState.widgets.find((widget) => widget.id === nativeDragWindow.desktopWidgetId)
+        Object.assign(restoredWidget, savedFrames.get(nativeDragWindow.desktopWidgetId))
+        await updateWorkspace(restoredState)
+        await new Promise((resolve) => setTimeout(resolve, 450))
+        console.log('[desktop-input] native organizer caption-drag assertion passed: pointer stayed aligned; same HWND; 0 sibling replacements')
       }
 
       const clickedWindow = organizers[0]

@@ -1647,11 +1647,16 @@ button:disabled {
   -webkit-app-region: drag;
 }
 
-/* A WS_EX_NOACTIVATE organizer cannot use Chromium's native drag region on
-   Windows. Keep it as a normal pointer surface; DesktopSurface moves only this
-   native window once per animation frame, so controls remain responsive. */
+/* Synthetic regression windows still use the renderer-driven path. Production
+   organizer windows use Chromium's native caption drag so Windows moves the
+   one HWND directly without an IPC round-trip on every pointer frame. */
 .desktop-surface.is-widget-window .widget-organizer .widget-drag-handle {
   -webkit-app-region: no-drag;
+}
+
+.desktop-surface.is-widget-window .widget-organizer.uses-native-window-drag .widget-drag-handle,
+.desktop-surface.is-widget-window .widget-organizer.uses-native-window-drag .widget-title-input {
+  -webkit-app-region: drag;
 }
 
 .desktop-surface.is-widget-window .widget-drag-handle button,
