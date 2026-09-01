@@ -1647,9 +1647,9 @@ button:disabled {
   -webkit-app-region: drag;
 }
 
-/* Synthetic regression windows still use the renderer-driven path. Production
-   organizer windows use Chromium's native caption drag so Windows moves the
-   one HWND directly without an IPC round-trip on every pointer frame. */
+/* Organizer windows are Explorer children, so they use the renderer-driven
+   logical frame path across monitors. Native caption dragging is reserved as
+   a diagnostic fallback because WS_CHILD coordinates are not per-monitor DIPs. */
 .desktop-surface.is-widget-window .widget-organizer .widget-drag-handle {
   -webkit-app-region: no-drag;
 }

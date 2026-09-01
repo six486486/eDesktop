@@ -14,6 +14,7 @@ param(
   [Int32]$DragEndClientX = -1,
   [Int32]$DragEndClientY = -1,
   [Int32]$DragSteps = 12,
+  [switch]$AllowNegativeDragEnd,
   [Int32]$InputHealthClientX = -1,
   [Int32]$InputHealthClientY = -1,
   [Int32]$ShapeClientX = -1,
@@ -450,7 +451,7 @@ if ($DirectDragStartClientX -ge 0 -or $DirectDragStartClientY -ge 0 -or $DirectD
 }
 
 if ($DragStartClientX -ge 0 -or $DragStartClientY -ge 0 -or $DragEndClientX -ge 0 -or $DragEndClientY -ge 0) {
-  if ($DragStartClientX -lt 0 -or $DragStartClientY -lt 0 -or $DragEndClientX -lt 0 -or $DragEndClientY -lt 0) {
+  if (($DragStartClientX -lt 0) -or ($DragStartClientY -lt 0) -or ((-not $AllowNegativeDragEnd) -and (($DragEndClientX -lt 0) -or ($DragEndClientY -lt 0)))) {
     throw 'All drag client coordinates must be non-negative.'
   }
   $startPoint = New-Object DesktopHostNative+POINT
