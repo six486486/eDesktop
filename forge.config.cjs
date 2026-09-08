@@ -34,12 +34,16 @@ module.exports = {
     electronZipDir: path.join(rootPath, '.electron-dist-cache'),
     afterExtract: [pruneElectronLocales],
     asar: {
-      unpackDir: 'electron',
+      unpackDir: '{electron,node_modules/sherpa-onnx-win-x64}',
     },
     ignore: [
-      /^\/(?:\.agents|\.artifacts|\.electron-dist-cache|\.git|\.superdesign|assets|out|scripts|src|UI风格参考)(?:\/|$)/,
+      /^\/(?:data|\.data-migration-[^/]*)(?:\/|$)/,
+      /^\/desktop-pet\/(?:tests(?:\/|$)|dev\.cjs$|.*\.(?:md|tsx?|css|html)$)/,
+      /^\/(?:\.agents|\.artifacts|\.electron-dist-cache|\.git|\.superdesign|assets|docs|out|scripts|src|UI风格参考)(?:\/|$)/,
+      /^\/\.env(?:\.|$)/,
+      /\.(?:log|jsonl)$/,
       /^\/(?:\.gitignore|README\.md|forge\.config\.cjs|index\.html|package-lock\.json|tsconfig(?:\.[^.]+)?\.(?:json|tsbuildinfo)|vite\.config\.(?:js|ts|d\.ts))$/,
-      /^\/node_modules(?:\/|$)/,
+      /^\/node_modules\/(?!sherpa-onnx-node(?:\/|$)|sherpa-onnx-win-x64(?:\/|$))/,
     ],
     win32metadata: {
       CompanyName: 'eDesktop',

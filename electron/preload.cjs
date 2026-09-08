@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('desktopAPI', {
   previewWidgetFrame: (id, patch) => ipcRenderer.send('workspace:preview-widget-frame', id, patch),
   removeWidget: (id) => ipcRenderer.invoke('workspace:remove-widget', id),
   setDesktopEnabled: (enabled) => ipcRenderer.invoke('workspace:set-desktop-enabled', enabled),
+  setDesktopPetEnabled: (enabled) => ipcRenderer.invoke('workspace:set-desktop-pet-enabled', enabled),
   setLaunchAtLogin: (enabled) => ipcRenderer.invoke('workspace:set-launch-at-login', enabled),
   listWorkspaceSnapshots: () => ipcRenderer.invoke('snapshots:list'),
   createWorkspaceSnapshot: () => ipcRenderer.invoke('snapshots:create'),

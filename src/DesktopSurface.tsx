@@ -124,6 +124,7 @@ export function DesktopSurface({ capture = false }: { capture?: boolean }) {
             <PomodoroWidget
               widget={widget}
               settingsOpen={settingsWidgetId === widget.id}
+              completionManaged={workspace.settings.desktopPetEnabled !== false}
               onCloseSettings={() => setSettingsWidgetId(null)}
             />
           )}

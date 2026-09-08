@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'preserve-package-data.ps1')
 $packageJsonPath = Join-Path $projectRoot 'package.json'
 $packageJsonText = [System.IO.File]::ReadAllText($packageJsonPath, [System.Text.Encoding]::UTF8)
 $packageJson = $packageJsonText | ConvertFrom-Json
@@ -55,7 +56,9 @@ try {
     }
   }
 
-  Compress-Archive -Path $packageDirectory -DestinationPath $archivePath -CompressionLevel Optimal
+  Invoke-WithPackageDataPreserved -ProjectRoot $projectRoot -Operation {
+    Compress-Archive -Path $packageDirectory -DestinationPath $archivePath -CompressionLevel Optimal
+  }
 
   $archive = Get-Item -LiteralPath $archivePath
   $sha256 = [System.Security.Cryptography.SHA256]::Create()

@@ -23,6 +23,7 @@ export interface TodoItem {
   completedOn?: string
   startTime?: string
   endTime?: string
+  reminderAt?: number
 }
 
 export type TodoListKind = 'my-day' | 'temporary'
@@ -52,6 +53,7 @@ export interface PomodoroWidgetData {
   running: boolean
   endsAt: number | null
   sessions: number
+  petFocus?: { id: string; minutes: number; status: 'active' | 'completed' } | null
 }
 
 export type DesktopWidgetData =
@@ -75,6 +77,7 @@ export interface DesktopWidget {
 
 export interface WorkspaceSettings {
   desktopEnabled: boolean
+  desktopPetEnabled: boolean
   launchAtLogin: boolean
   snapshotAutoEnabled: boolean
   snapshotRetention: number
@@ -182,6 +185,7 @@ export interface DesktopAPI {
   previewWidgetFrame: (id: string, patch: Pick<Partial<DesktopWidget>, 'x' | 'y' | 'width' | 'height'>) => void
   removeWidget: (id: string) => Promise<WorkspaceState>
   setDesktopEnabled: (enabled: boolean) => Promise<WorkspaceState>
+  setDesktopPetEnabled: (enabled: boolean) => Promise<WorkspaceState>
   setLaunchAtLogin: (enabled: boolean) => Promise<WorkspaceState>
   listWorkspaceSnapshots: () => Promise<WorkspaceSnapshotSummary[]>
   createWorkspaceSnapshot: () => Promise<WorkspaceSnapshotSummary | null>

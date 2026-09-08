@@ -506,6 +506,11 @@ button:disabled {
   background: #e7f3ff;
 }
 
+.control-row-icon.is-pet {
+  color: #548477;
+  background: #e8f2ed;
+}
+
 .control-row-icon.kind-note,
 .widget-kind-mark.kind-note {
   color: #7a5900;

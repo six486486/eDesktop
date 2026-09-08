@@ -1,5 +1,6 @@
 import {
   Archive,
+  Cat,
   CheckSquare2,
   ChevronDown,
   ChevronRight,
@@ -54,7 +55,7 @@ const pageCopy: Record<ControlPage, { title: string; description: string }> = {
 }
 
 const pageSearchTerms: Record<ControlPage, string> = {
-  basic: '基础设置 显示 桌面 组件 开机 自动运行 启动 数据 安全 文件 文档',
+  basic: '基础设置 显示 桌面 组件 桌宠 小栖 Ollama 开机 自动运行 启动 数据 安全 文件 文档',
   add: '添加组件 新建 收纳盒 便签 待办列表 番茄钟',
   widgets: '已有组件 管理 收纳盒 便签 待办列表 番茄钟 改名 显示 隐藏 删除',
   snapshots: '快照 恢复 自动 历史 配置 导入 导出 多屏幕 显示器',
@@ -129,6 +130,10 @@ export function ControlCenter() {
 
   const toggleDesktop = async () => {
     await api?.setDesktopEnabled(!workspace.settings.desktopEnabled)
+  }
+
+  const toggleDesktopPet = async () => {
+    await api?.setDesktopPetEnabled(!workspace.settings.desktopPetEnabled)
   }
 
   const resolveCloseRequest = (action: CloseRequestAction) => {
@@ -332,6 +337,16 @@ export function ControlCenter() {
                         <small>控制所有桌面组件是否显示</small>
                       </span>
                       <input type="checkbox" checked={workspace.settings.desktopEnabled} onChange={toggleDesktop} />
+                      <i className="fluent-switch" />
+                    </label>
+
+                    <label className="control-setting-row">
+                      <span className="control-row-icon is-pet"><Cat size={18} /></span>
+                      <span className="control-row-copy">
+                        <strong>桌宠小栖</strong>
+                        <small>打开后显示在桌面，聊天自动连接本机 Ollama</small>
+                      </span>
+                      <input type="checkbox" checked={workspace.settings.desktopPetEnabled} onChange={toggleDesktopPet} />
                       <i className="fluent-switch" />
                     </label>
 

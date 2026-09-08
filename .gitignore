@@ -4,9 +4,13 @@ out/
 .artifacts/
 .electron-dist-cache/
 .superdesign/
+docs/interview-prep/
+data/
+.data-migration-*/
 .env
 .env.*
 !.env.example
 UI风格参考/
 *.log
+*.jsonl
 *.tsbuildinfo

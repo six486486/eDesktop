@@ -6,6 +6,7 @@ const emptyWorkspace: WorkspaceState = {
   widgets: [],
   settings: {
     desktopEnabled: true,
+    desktopPetEnabled: true,
     launchAtLogin: false,
     snapshotAutoEnabled: true,
     snapshotRetention: 30,

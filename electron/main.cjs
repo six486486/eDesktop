@@ -6,7 +6,10 @@ const path = require('node:path')
 const { promisify } = require('node:util')
 const { resolveWindowsLoginLauncherPath } = require('./login-item-path.cjs')
 const { installSafeConsole } = require('./safe-console.cjs')
+const { initializePortableData } = require('./portable-data.cjs')
 const { createWidget: createWidgetModel, safeWidgetPatch } = require('./widget-model.cjs')
+const { createDesktopPet } = require('../desktop-pet/main.cjs')
+const { createFocusHost } = require('../desktop-pet/focus-host.cjs')
 const {
   findDesktopIconPositionByNames,
   restoreDesktopIconLayout,
@@ -46,6 +49,8 @@ const desktopTrayTest = process.env.EDESKTOP_TRAY_TEST === '1'
 const iconTest = process.env.EDESKTOP_ICON_TEST === '1'
 const safeConsolePipeTest = process.env.EDESKTOP_SAFE_CONSOLE_TEST === '1'
 const workspaceSnapshotTest = process.env.EDESKTOP_SNAPSHOT_TEST === '1'
+const desktopPetSettingsTest = process.env.EDESKTOP_PET_SETTINGS_TEST === '1'
+const dataPathTest = process.env.EDESKTOP_DATA_PATH_TEST === '1'
 const desktopHostSelfCapturePath = process.env.EDESKTOP_HOST_SELF_CAPTURE_PATH
 const squirrelCommand = process.platform === 'win32' ? process.argv[1] : ''
 
@@ -102,19 +107,23 @@ const enforceSingleInstance = !squirrelStartup
   && !iconTest
   && !safeConsolePipeTest
   && !workspaceSnapshotTest
-const hasPrimaryInstance = !enforceSingleInstance || app.requestSingleInstanceLock()
-if (squirrelStartup || !hasPrimaryInstance) app.quit()
-
-if (process.env.EDESKTOP_USER_DATA_PATH) {
-  app.setPath('userData', path.resolve(process.env.EDESKTOP_USER_DATA_PATH))
-} else if (desktopTrayTest || iconTest) {
-  app.setPath('userData', path.join(process.cwd(), '.artifacts', 'tray-test-user-data'))
-} else {
-  app.setPath('userData', path.join(app.getPath('appData'), 'eDesktop'))
+  && !desktopPetSettingsTest
+let hasPrimaryInstance = false
+if (!squirrelStartup) {
+  try {
+    hasPrimaryInstance = initializePortableData(app, {
+      projectRoot: path.resolve(__dirname, '..'), enforceSingleInstance,
+      override: process.env.EDESKTOP_USER_DATA_PATH || ((desktopTrayTest || iconTest) ? path.join(process.cwd(), '.artifacts', 'tray-test-user-data') : undefined),
+    })
+  } catch (error) { dialog.showErrorBox('eDesktop 数据目录未准备好', error.message) }
 }
+if (squirrelStartup || !hasPrimaryInstance) app.quit()
 
 let controlWindow = null
 let tray = null
+let desktopPet = null
+let petFocusHost = null
+let desktopPetLifecycle = Promise.resolve()
 let controlClosePromptVisible = false
 let fullQuitRequested = false
 let desktopWindow = null
@@ -293,6 +302,7 @@ const defaultWorkspace = () => ({
   desktopIconLayoutProfiles: [],
   settings: {
     desktopEnabled: true,
+    desktopPetEnabled: true,
     launchAtLogin: false,
     snapshotAutoEnabled: true,
     snapshotRetention: 30,
@@ -2255,6 +2265,7 @@ const broadcastWorkspace = () => {
   for (const win of liveAppWindows()) {
     win.webContents.send('workspace:changed', state)
   }
+  petFocusHost?.changed()
 }
 
 const currentDesktopStatus = () => ({
@@ -3951,6 +3962,102 @@ const setDesktopEnabled = async (enabled) => {
   return result
 }
 
+const createPetFocusHost = () => createFocusHost({
+  read: () => workspaceState, enqueue: enqueueWorkspaceMutation,
+  createWidget: (_next, kind = 'pomodoro') => createWidget(kind),
+  persist: next => writeJsonAtomically(workspacePath, next),
+  publish: next => {
+    workspaceState = next
+    if (!desktopTopologyTransitionRevision) syncDesktopWidgetWindows()
+    broadcastWorkspace()
+  },
+})
+
+const startDesktopPet = () => {
+  if (desktopPet) return
+  petFocusHost = createPetFocusHost()
+  desktopPet = createDesktopPet({
+    focusHost: petFocusHost,
+    initialVisible: true,
+    onVisibilityChanged: () => tray?.setContextMenu(buildTrayMenu()),
+    onRequestDisable: () => {
+      void setDesktopPetEnabled(false)
+        .catch((error) => dialog.showErrorBox('桌宠关闭失败', error.message))
+    },
+  })
+  tray?.setContextMenu(buildTrayMenu())
+}
+
+const stopDesktopPet = async () => {
+  const pet = desktopPet
+  desktopPet = null
+  petFocusHost = null
+  tray?.setContextMenu(buildTrayMenu())
+  await pet?.dispose()
+}
+
+const syncDesktopPetToWorkspace = async () => {
+  if (workspaceState?.settings?.desktopPetEnabled !== false) startDesktopPet()
+  else await stopDesktopPet()
+}
+
+const setDesktopPetEnabled = (enabled) => {
+  const desktopPetEnabled = Boolean(enabled)
+  const apply = async () => {
+    const result = await enqueueWorkspaceMutation(async () => {
+      const nextState = cloneWorkspace()
+      nextState.settings.desktopPetEnabled = desktopPetEnabled
+      return updateWorkspace(nextState)
+    })
+    try {
+      await syncDesktopPetToWorkspace()
+    } catch (error) {
+      await enqueueWorkspaceMutation(async () => {
+        const rollback = cloneWorkspace()
+        rollback.settings.desktopPetEnabled = !desktopPetEnabled
+        return updateWorkspace(rollback)
+      })
+      await syncDesktopPetToWorkspace()
+      throw error
+    }
+    tray?.setContextMenu(buildTrayMenu())
+    return result
+  }
+  const work = desktopPetLifecycle.then(apply, apply)
+  desktopPetLifecycle = work.catch(() => {})
+  return work
+}
+
+const desktopPetWindows = () => BrowserWindow.getAllWindows().filter((win) => (
+  !win.isDestroyed() && (win.getTitle() === 'eDesktop · 小栖' || win.webContents.getURL().includes('desktop-pet'))
+))
+
+const runDesktopPetSettingsRegression = async () => {
+  const keepAlive = new BrowserWindow({ show: false })
+  try {
+    await syncDesktopPetToWorkspace()
+    if (!desktopPet || !petFocusHost || desktopPetWindows().length !== 1) {
+      throw new Error('desktop pet did not start from the workspace setting')
+    }
+    await setDesktopPetEnabled(false)
+    if (desktopPet || petFocusHost || desktopPetWindows().length !== 0
+      || ipcMain.listenerCount('pet:stop') !== 0 || workspaceState.settings.desktopPetEnabled !== false) {
+      throw new Error('desktop pet resources were not released after disabling')
+    }
+    await setDesktopPetEnabled(true)
+    if (!desktopPet || !petFocusHost || desktopPetWindows().length !== 1
+      || ipcMain.listenerCount('pet:stop') !== 1 || workspaceState.settings.desktopPetEnabled !== true) {
+      throw new Error('desktop pet did not restart cleanly after enabling')
+    }
+    const saved = JSON.parse(await fs.promises.readFile(workspacePath, 'utf8'))
+    if (saved.settings?.desktopPetEnabled !== true) throw new Error('desktop pet setting was not persisted')
+    console.log('[desktop-pet] settings lifecycle assertion passed: enabled -> zero resources -> enabled')
+  } finally {
+    await stopDesktopPet()
+    keepAlive.destroy()
+  }
+}
+
 const appIconPath = () => app.isPackaged
   ? path.join(process.resourcesPath, 'app-icon.ico')
   : path.join(process.cwd(), 'assets', 'app-icon.ico')
@@ -4004,6 +4111,13 @@ const buildTrayMenu = () => {
   return Menu.buildFromTemplate([
     { label: '打开控制中心', click: showControlCenter },
     { label: '隐藏控制中心', click: () => controlWindow?.hide() },
+    ...(!desktopTrayTest ? [{
+      label: '桌宠小栖', type: 'checkbox', checked: workspaceState?.settings?.desktopPetEnabled !== false,
+      click: (item) => {
+        void setDesktopPetEnabled(item.checked)
+          .catch((error) => dialog.showErrorBox('桌宠设置未保存', error.message))
+      },
+    }] : []),
     { type: 'separator' },
     {
       label: desktopEnabled ? '暂停桌面组件' : '显示桌面组件',
@@ -7273,6 +7387,7 @@ const registerIpc = () => {
   ipcMain.handle('workspace:set-desktop-enabled', (_event, enabled) => (
     enqueueWorkspaceMutation(() => setDesktopEnabled(enabled))
   ))
+  ipcMain.handle('workspace:set-desktop-pet-enabled', (_event, enabled) => setDesktopPetEnabled(enabled))
   ipcMain.handle('workspace:set-launch-at-login', (_event, enabled) => enqueueWorkspaceMutation(async () => {
     const launchAtLogin = Boolean(enabled)
     applyLoginItemSettings(launchAtLogin)
@@ -7284,9 +7399,11 @@ const registerIpc = () => {
   ipcMain.handle('snapshots:create', () => (
     enqueueSnapshotMutation(() => createWorkspaceSnapshot('手动快照'))
   ))
-  ipcMain.handle('snapshots:restore', (_event, snapshotId) => (
-    enqueueWorkspaceMutation(() => enqueueSnapshotMutation(() => restoreWorkspaceSnapshot(snapshotId)))
-  ))
+  ipcMain.handle('snapshots:restore', async (_event, snapshotId) => {
+    const result = await enqueueWorkspaceMutation(() => enqueueSnapshotMutation(() => restoreWorkspaceSnapshot(snapshotId)))
+    await syncDesktopPetToWorkspace()
+    return result
+  })
   ipcMain.handle('snapshots:delete', (_event, snapshotId) => enqueueSnapshotMutation(async () => {
     await fs.promises.unlink(snapshotFilePath(snapshotId))
     return listWorkspaceSnapshots()
@@ -7391,6 +7508,10 @@ const registerIpc = () => {
 }
 
 if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
+  if (dataPathTest) {
+    console.log('[data-path] ' + JSON.stringify(Object.fromEntries(['userData', 'sessionData', 'logs', 'crashDumps'].map(name => [name, app.getPath(name)]))))
+    app.quit(); return
+  }
   if (iconTest) {
     const sourceIcon = loadAppIcon()
     const trayIcon = createTrayIcon()
@@ -7430,6 +7551,17 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
   // otherwise healthy organizer host during startup.
   desktopTopologySignature = runtimeDisplayTopologySignature()
   await loadWorkspace()
+  if (desktopPetSettingsTest) {
+    try {
+      registerIpc()
+      await runDesktopPetSettingsRegression()
+    } catch (error) {
+      console.error(`[desktop-pet] settings lifecycle failed: ${error.stack || error.message}`)
+      process.exitCode = 1
+    }
+    app.quit()
+    return
+  }
   if (workspaceSnapshotTest) {
     try {
       await runWorkspaceSnapshotIntegration()
@@ -8532,6 +8664,8 @@ if (!squirrelStartup && hasPrimaryInstance) app.whenReady().then(async () => {
     createDesktopWidgetWindows()
     createControlWindow()
     scheduleOrganizerStorageReconcileRetry()
+    await syncDesktopPetToWorkspace()
+    tray?.setContextMenu(buildTrayMenu())
   }
 
   app.on('activate', () => {
@@ -8571,15 +8705,17 @@ app.on('before-quit', (event) => {
   if (desktopOrganizerBandHealthTimer) clearInterval(desktopOrganizerBandHealthTimer)
   if (desktopWidgetGeometryHealthTimer) clearInterval(desktopWidgetGeometryHealthTimer)
   if (organizerStorageReconcileRetryTimer) clearTimeout(organizerStorageReconcileRetryTimer)
-  if (capturePath || desktopHostTest || desktopTrayTest || iconTest || workspaceSnapshotTest || quitAfterRestore) {
+  if (capturePath || desktopHostTest || desktopTrayTest || iconTest || workspaceSnapshotTest || desktopPetSettingsTest || dataPathTest || quitAfterRestore) {
     stopDesktopIconHelper()
     return
   }
 
   event.preventDefault()
   if (restoreOnQuitPromise) return
+  const petShutdown = desktopPetLifecycle.then(stopDesktopPet, stopDesktopPet)
   for (const win of liveAppWindows()) win.hide()
   restoreOnQuitPromise = enqueueWorkspaceMutation(async () => {
+    await petShutdown
     await createAutomaticSafetySnapshot('退出时自动快照')
     return restoreOrganizerFilesToOriginalLocations({
       preserveOrganizerMembership: true,

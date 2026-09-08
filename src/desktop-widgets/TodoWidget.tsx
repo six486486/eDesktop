@@ -15,7 +15,7 @@ import type {
   TodoWidgetData,
 } from '../types'
 
-export function TodoWidget({ widget }: { widget: DesktopWidget }) {
+export function TodoWidget({ widget, onUpdate }: { widget: DesktopWidget; onUpdate?: (data: TodoWidgetData) => Promise<unknown> }) {
   const data = widget.data as TodoWidgetData
   const items = Array.isArray(data.items) ? data.items : []
   const api = window.desktopAPI
@@ -24,6 +24,7 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
   const [textDraft, setTextDraft] = useState('')
   const [startTimeDraft, setStartTimeDraft] = useState('')
   const [endTimeDraft, setEndTimeDraft] = useState('')
+  const [reminderDraft, setReminderDraft] = useState('')
   const [isWide, setIsWide] = useState(widget.width >= 540)
   const [activeList, setActiveList] = useState<TodoListKind>(data.activeList === 'my-day' ? 'my-day' : 'temporary')
   const [listMenuOpen, setListMenuOpen] = useState(false)
@@ -43,7 +44,7 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
       : Boolean(item.completed)
   )
   const save = (nextItems: TodoItem[], patch: Partial<TodoWidgetData> = {}) => (
-    api?.updateWidget(widget.id, { data: { ...data, activeList, ...patch, items: nextItems } })
+    onUpdate ? onUpdate({ ...data, activeList, ...patch, items: nextItems }) : api?.updateWidget(widget.id, { data: { ...data, activeList, ...patch, items: nextItems } })
   )
 
   useEffect(() => {
@@ -165,6 +166,7 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
     setTextDraft(item.text)
     setStartTimeDraft(item.startTime || '')
     setEndTimeDraft(item.endTime || '')
+    setReminderDraft(Number.isFinite(item.reminderAt) ? new Date(item.reminderAt! - new Date(item.reminderAt!).getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '')
     setSettingsItemId(item.id)
   }
   const saveSettings = (event: FormEvent<HTMLFormElement>) => {
@@ -192,6 +194,10 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
     save(items.map((item) => {
       if (item.id !== settingsItem.id) return item
       const nextItem = { ...item, text }
+      if (itemList(item) === 'temporary') {
+        if (reminderDraft) nextItem.reminderAt = new Date(reminderDraft).getTime()
+        else delete nextItem.reminderAt
+      }
       if (startTimeDraft && endTimeDraft) {
         nextItem.startTime = startTimeDraft
         nextItem.endTime = endTimeDraft
@@ -378,6 +384,7 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
                   {item.startTime && item.endTime && (
                     <time className="todo-time-range">{item.startTime} – {item.endTime}</time>
                   )}
+                  {itemList(item) === 'temporary' && Number.isFinite(item.reminderAt) && <time className="todo-time-range" dateTime={new Date(item.reminderAt!).toISOString()}>提醒 · {new Date(item.reminderAt!).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}</time>}
                 </div>
                 <button
                   type="button"
@@ -475,6 +482,10 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
                 />
               </label>
             </div>
+            {itemList(settingsItem) === 'temporary' && <label className="todo-item-settings-text">
+              <span>提醒时间（留空不提醒）</span>
+              <input type="datetime-local" aria-label="临时提醒时间" value={reminderDraft} onChange={event => setReminderDraft(event.target.value)} />
+            </label>}
             <div className="todo-item-settings-actions">
               <button
                 type="button"
@@ -493,6 +504,7 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
                   onClick={() => {
                     setStartTimeDraft('')
                     setEndTimeDraft('')
+                    setReminderDraft('')
                   }}
                 >
                   清除时间
@@ -506,4 +518,3 @@ export function TodoWidget({ widget }: { widget: DesktopWidget }) {
     </div>
   )
 }
-

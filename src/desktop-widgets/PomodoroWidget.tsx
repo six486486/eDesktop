@@ -70,10 +70,12 @@ function FlipDigit({ value, position }: { value: string; position: string }) {
   )
 }
 
-export function PomodoroWidget({ widget, settingsOpen, onCloseSettings }: {
+export function PomodoroWidget({ widget, settingsOpen, onCloseSettings, onUpdate, completionManaged = false }: {
   widget: DesktopWidget
   settingsOpen: boolean
   onCloseSettings: () => void
+  onUpdate?: (data: PomodoroWidgetData) => Promise<unknown>
+  completionManaged?: boolean
 }) {
   const data = { ...defaultPomodoro, ...(widget.data as PomodoroWidgetData) }
   const [now, setNow] = useState(Date.now())
@@ -120,25 +122,30 @@ export function PomodoroWidget({ widget, settingsOpen, onCloseSettings }: {
 
   useEffect(() => {
     if (!data.running || remaining > 0 || completing.current) return
+    // With the pet enabled, the main process saves each completed phase before
+    // notifying. A renderer must not consume that deadline first.
+    if (completionManaged) return
     completing.current = true
     const nextMode = data.mode === 'focus' ? 'break' : 'focus'
     const duration = nextMode === 'focus' ? data.focusMinutes : data.breakMinutes
-    window.desktopAPI?.updateWidget(widget.id, {
-      data: {
-        ...data,
-        mode: nextMode,
-        remainingSeconds: duration * 60,
-        running: false,
-        endsAt: null,
-        sessions: data.sessions + (data.mode === 'focus' ? 1 : 0),
-      },
-    }).finally(() => {
+    const next: PomodoroWidgetData = {
+      ...data,
+      mode: nextMode,
+      remainingSeconds: duration * 60,
+      running: false,
+      endsAt: null,
+      sessions: data.sessions + (data.mode === 'focus' ? 1 : 0),
+      petFocus: null,
+    }
+    const saved = onUpdate ? onUpdate(next) : window.desktopAPI?.updateWidget(widget.id, { data: next })
+    saved?.finally(() => {
       completing.current = false
     })
-  }, [data, remaining, widget.id])
+  }, [data, remaining, widget.id, onUpdate, completionManaged])
 
   const update = (next: Partial<PomodoroWidgetData>) => {
-    return window.desktopAPI?.updateWidget(widget.id, { data: { ...data, ...next } })
+    const updated = { ...data, ...next }
+    return onUpdate ? onUpdate(updated) : window.desktopAPI?.updateWidget(widget.id, { data: updated })
   }
   const saveDurations = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -153,6 +160,7 @@ export function PomodoroWidget({ widget, settingsOpen, onCloseSettings }: {
       remainingSeconds,
       running: false,
       endsAt: null,
+      petFocus: null,
     })?.then(onCloseSettings)
   }
   const toggle = () => {
@@ -172,16 +180,16 @@ export function PomodoroWidget({ widget, settingsOpen, onCloseSettings }: {
   }
   const reset = () => {
     const minutes = data.mode === 'focus' ? data.focusMinutes : data.breakMinutes
-    update({ running: false, endsAt: null, remainingSeconds: minutes * 60 })
+    update({ running: false, endsAt: null, remainingSeconds: minutes * 60, petFocus: null })
   }
   const skip = () => {
     const nextMode = data.mode === 'focus' ? 'break' : 'focus'
     const minutes = nextMode === 'focus' ? data.focusMinutes : data.breakMinutes
-    update({ mode: nextMode, running: false, endsAt: null, remainingSeconds: minutes * 60 })
+    update({ mode: nextMode, running: false, endsAt: null, remainingSeconds: minutes * 60, petFocus: null })
   }
   const minutes = Math.floor(remaining / 60).toString().padStart(2, '0')
   const seconds = (remaining % 60).toString().padStart(2, '0')
-  const total = (data.mode === 'focus' ? data.focusMinutes : data.breakMinutes) * 60
+  const total = (data.mode === 'focus' ? (data.petFocus?.status === 'active' ? data.petFocus.minutes : data.focusMinutes) : data.breakMinutes) * 60
   const progress = total > 0 ? Math.max(0, Math.min(100, ((total - remaining) / total) * 100)) : 0
 
   if (settingsOpen) {

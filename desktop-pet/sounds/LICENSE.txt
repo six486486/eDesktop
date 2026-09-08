@@ -1,0 +1,9 @@
+meow.wav
+Source: "Kitten Meowing.wav" by lolamadeus (2013-08-07)
+https://freesound.org/people/lolamadeus/sounds/196251/
+License: CC0 1.0 Universal
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Adaptation for eDesktop: first meow excerpt (0.43-1.12 seconds) from the public
+high-quality MP3 preview, converted to mono PCM WAV, normalized, and faded at
+both ends. No speech synthesis or additional model is used during playback.
