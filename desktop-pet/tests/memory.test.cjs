@@ -40,6 +40,92 @@ function fixture(t, fetchImpl, options = {}) {
 const records = harness => fs.readFileSync(harness.memoryLogFile, 'utf8').trim().split('\n').map(JSON.parse)
 async function say(harness, text) { harness.start(text); await harness.running }
 
+test('manual chat preferences work offline, preserve unrelated data and survive restart without adding conversation', t => {
+  let requests = 0
+  const { harness, directory } = fixture(t, () => { requests++; throw new Error('offline') })
+  harness.setPreferences({ position: { x: 120, y: 200 }, reminderSoundEnabled: false })
+  const saved = harness.setChatPreferences({ preferredName: '  小李  ', replyLength: 'short', followUp: 'avoid' })
+  assert.deepEqual(saved, { preferredName: '小李', replyLength: 'short', followUp: 'avoid' })
+  assert.deepEqual(harness.messages, [])
+  assert.equal(requests, 0)
+  assert.equal(harness.chatPreferences.preferredName.method, 'settings')
+  const restored = new PetHarness({ directory })
+  t.after(() => restored.stop('shutdown'))
+  assert.deepEqual(restored.snapshot().chatPreferences, saved)
+  assert.equal(restored.chatPreferences.preferredName.method, 'settings')
+  assert.deepEqual(restored.position, { x: 120, y: 200 })
+  assert.equal(restored.reminderSoundEnabled, false)
+  assert.equal(restored.model, 'local-model')
+  restored.setChatPreferences({ preferredName: ' ' })
+  assert.equal(restored.snapshot().chatPreferences.preferredName, null)
+  assert.equal(restored.snapshot().chatPreferences.replyLength, 'short')
+})
+
+test('conversation and settings share preferences with last explicit change winning and temporary overrides staying local', async t => {
+  const requests = []
+  const { harness } = fixture(t, (_url, options) => { requests.push(JSON.parse(options.body)); return chatResponse() })
+  harness.setChatPreferences({ preferredName: '小李', replyLength: 'short', followUp: 'avoid' })
+  await say(harness, '这次回答详细一点')
+  assert.match(requests.at(-1).messages[0].content, /稍微展开/)
+  assert.equal(harness.chatPreferences.replyLength.value, 'short')
+  await say(harness, '以后叫我小林，回答详细一点，可以追问我')
+  assert.deepEqual(harness.snapshot().chatPreferences, { preferredName: '小林', replyLength: 'detailed', followUp: 'natural' })
+  harness.setChatPreferences({ replyLength: 'short' })
+  assert.equal(harness.snapshot().chatPreferences.preferredName, '小林')
+  harness.resetConversation()
+  await say(harness, '我回来了')
+  assert.match(requests.at(-1).messages[0].content, /小林/)
+  assert.match(requests.at(-1).messages[0].content, /一到两句/)
+  await say(harness, '恢复默认聊天偏好')
+  assert.deepEqual(harness.snapshot().chatPreferences, { preferredName: null, replyLength: 'normal', followUp: 'natural' })
+})
+
+test('manual changes preempt late memory work and older evidence cannot overwrite them on a later review', async t => {
+  const delayed = deferred()
+  let extractions = 0, extractionSignal
+  const raw = output(candidate('followUp', 'avoid', ''), { ...candidate('replyLength', 'short', ''), segment: 1 })
+  const { harness } = fixture(t, (_url, options) => {
+    if (JSON.parse(options.body).stream) return chatResponse()
+    extractions++
+    if (extractions === 1) { extractionSignal = options.signal; return delayed.promise }
+    return response(raw)
+  })
+  await say(harness, '每次都像采访，随便聊聊就好。平时一大屏文字我看不进去，抓重点就行。')
+  const review = harness.reviewMemory()
+  await tick()
+  harness.setChatPreferences({ followUp: 'natural' })
+  assert.equal(extractionSignal.aborted, true)
+  await review
+  delayed.resolve(response(raw)); await tick()
+  assert.equal(harness.chatPreferences.followUp.value, 'natural')
+  assert.equal(harness.memoryCursor, 0)
+  await harness.reviewMemory()
+  assert.deepEqual(values(harness.chatPreferences), { followUp: 'natural', replyLength: 'short' })
+  assert.equal(harness.chatPreferences.followUp.method, 'settings')
+})
+
+test('invalid or failed manual saves leave preferences, source order and active reply intact', async t => {
+  const delayed = deferred()
+  const { harness } = fixture(t, () => delayed.promise)
+  harness.setChatPreferences({ preferredName: '小李' })
+  harness.start('继续聊聊')
+  const active = harness.activeRun, before = harness.snapshot(), sequence = harness.userSequence
+  for (const patch of [null, [], 'short', { enabled: false }, { preferredName: '李'.repeat(25) }, { preferredName: '小明', replyLength: 'huge' }, { followUp: null }]) {
+    assert.throws(() => harness.setChatPreferences(patch))
+  }
+  const save = harness.save
+  harness.save = () => { throw new Error('disk full') }
+  assert.throws(() => harness.setChatPreferences({ preferredName: '小林' }), /聊天偏好未能保存/)
+  assert.deepEqual(harness.snapshot(), before)
+  assert.equal(harness.userSequence, sequence)
+  assert.equal(active.controller.signal.aborted, false)
+  harness.save = save
+  harness.setChatPreferences({ replyLength: 'detailed' })
+  assert.equal(harness.activeRun, active, 'current reply continues; the new preference applies next time')
+  delayed.resolve(chatResponse()); await harness.running
+  assert.equal(harness.snapshot().chatPreferences.replyLength, 'detailed')
+})
+
 test('model candidates require valid values, original evidence, correct source and unambiguous claims', () => {
   const sources = [source('平时一大屏文字我看不进去，抓重点就行。以后叫我小林。')]
   const good = candidate('replyLength', 'short', '平时一大屏文字我看不进去，抓重点就行。')

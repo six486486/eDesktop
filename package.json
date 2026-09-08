@@ -1,7 +1,7 @@
 {
   "name": "edesktop",
   "productName": "eDesktop",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Windows 10/11 桌面整理与效率工具",
   "author": "six486486",
@@ -26,6 +26,7 @@
     "test:pet-voice-ui": "electron desktop-pet/tests/voice-electron.cjs",
     "test:pet-voice-native": "electron desktop-pet/tests/voice-native.cjs",
     "test:pet-settings": "cross-env EDESKTOP_PET_SETTINGS_TEST=1 EDESKTOP_USER_DATA_PATH=.artifacts/desktop-pet-settings-test electron .",
+    "test:pet-chat-preferences": "electron desktop-pet/tests/chat-preferences-electron.cjs",
     "test:pet-offline": "electron desktop-pet/tests/offline-electron.cjs",
     "test:pet-reminder-ui": "electron desktop-pet/tests/reminder-electron.cjs",
     "test:pet-sound": "electron desktop-pet/tests/sound-electron.cjs",

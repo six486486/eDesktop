@@ -30,7 +30,7 @@ async function opened() {
 async function screenshot(win, name) { await delay(550); fs.writeFileSync(path.join(directory, `${name}.png`), (await win.webContents.capturePage()).toPNG()) }
 app.whenReady().then(async () => {
   const host = createFocusPreview(dataDirectory); pet = createDesktopPet({ dataDirectory, focusHost: host }); let chat = await opened()
-  await click(chat, '天气与提醒'); await until(() => evaluate(chat, 'Boolean(document.querySelector(".reminder-settings"))'))
+  await click(chat, '小栖设置'); await until(() => evaluate(chat, 'Boolean(document.querySelector(".reminder-settings"))'))
   await fill(chat, '搜索天气城市', '杭州'); await delay(30); await click(chat, '搜索城市')
   await until(() => evaluate(chat, 'Boolean(document.querySelector(".reminder-city-results button"))'))
   await click(chat, '杭州 · 浙江 · 中国'); await evaluate(chat, 'document.querySelector("[aria-label=天气定时播报]").click()')

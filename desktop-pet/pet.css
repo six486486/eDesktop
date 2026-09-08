@@ -191,6 +191,12 @@ button:focus-visible, select:focus-visible { outline: 2px solid #548477; outline
 .memory-entry strong { display: block; font-size: 12px; font-weight: 600; }
 .memory-entry small { display: block; margin-top: 4px; font-size: 10px; color: #8a9480; }
 .memory-entry:hover { background: #f7f1e5; }
+.chat-preferences fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.chat-preferences .reminder-settings-heading { margin-bottom: 8px; }
+.chat-preferences .memory-intro { margin: 0; font-size: 12px; line-height: 1.6; }
+.chat-preferences .reminder-field { margin-top: 12px; }
+.chat-preferences .reminder-hint { margin: 12px 0; }
+.preference-field-hint { display: block; margin-top: 6px; color: #859084; font-size: 10px; line-height: 1.6; }
 .memory-intro { margin: 0 0 18px; font: 13px var(--pet-speech-font); color: #7a8775; line-height: 1.8; }
 .memory-tabs { display: flex; gap: 6px; margin-bottom: 15px; padding: 4px; background: #edf0e6; border-radius: 12px; }
 .memory-tabs button { flex: 1; padding: 8px; border: 0; border-radius: 9px; background: transparent; color: #7e8e7d; font-size: 12px; }

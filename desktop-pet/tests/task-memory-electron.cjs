@@ -25,7 +25,7 @@ app.whenReady().then(async () => {
   pet = createDesktopPet({ dataDirectory, focusHost: host }); pet.openChat()
   const chat = BrowserWindow.getAllWindows().find(w => w.getTitle().includes('聊一会儿'))
   await until(() => evaluate(chat, 'Boolean(document.querySelector("textarea"))'))
-  await click(chat, '天气与提醒'); await click(chat, '小栖记住的事')
+  await click(chat, '小栖设置'); await click(chat, '小栖记住的事')
   await until(() => evaluate(chat, 'document.querySelectorAll(".memory-card").length === 2'))
   await delay(250); fs.writeFileSync(path.join(directory, 'habits.png'), (await chat.webContents.capturePage()).toPNG())
   await evaluate(chat, 'document.querySelector(".memory-card summary").click()')

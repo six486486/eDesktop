@@ -87,7 +87,7 @@ app.whenReady().then(async () => {
   const replyCat = await evaluate(petWin(), 'document.querySelector("svg").outerHTML')
   // Meow follows real audio playback events; capture the mouth mid-clip.
   pet.openChat(); await until(() => chat.isVisible())
-  await evaluate(chat, 'document.querySelector("[aria-label=天气与提醒]").click()')
+  await evaluate(chat, 'document.querySelector("[aria-label=小栖设置]").click()')
   await until(() => evaluate(chat, 'Boolean(document.querySelector("[aria-label=试听喵声]"))'))
   chat.webContents.setAudioMuted(true)
   await evaluate(chat, 'document.querySelector("[aria-label=试听喵声]").click()')

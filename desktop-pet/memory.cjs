@@ -75,10 +75,18 @@ function readChatPreferences(saved) {
       }
       result[key] = { value: entry.value, sourceMessageId: entry.sourceMessageId, evidence: entry.evidence, updatedAt: entry.updatedAt }
       if (Number.isSafeInteger(entry.sourceSequence) && entry.sourceSequence > 0) result[key].sourceSequence = entry.sourceSequence
-      if (['explicit', 'model'].includes(entry.method)) result[key].method = entry.method
+      if (['explicit', 'model', 'settings'].includes(entry.method)) result[key].method = entry.method
     }
   }
   return result
+}
+
+function chatPreferenceValues(memory) {
+  return {
+    preferredName: memory.preferredName?.value ?? null,
+    replyLength: memory.replyLength?.value ?? 'normal',
+    followUp: memory.followUp?.value ?? 'natural',
+  }
 }
 
 function extractExplicitPreferences(current, message) {
@@ -132,7 +140,7 @@ function extractExplicitPreferences(current, message) {
     if (/^(?:(?:别|不要|不用|不必)(?:总是?|老是?|一直|再|每次|老)?(?:反问|追问|问我问题|问我|提问)(?:我|问题)?|我不喜欢(?:被|你)?(?:总是?|老是?)?(?:反问|追问|问问题))(?:了|啦|吧)?$/.test(plain)) {
       assign('followUp', 'avoid'); continue
     }
-    if (/^(?:(?:可以|允许你|欢迎你)(?:适当|多)?(?:追问|反问|问我(?:问题)?|提问)|我(?:喜欢|不介意)(?:你)?(?:适当|多)?(?:追问|反问|问我(?:问题)?|提问))(?:吧|了)?$/.test(plain)) {
+    if (/^(?:(?:可以|允许你|欢迎你)(?:适当|多)?(?:(?:追问|反问)(?:我)?|问我(?:问题)?|提问)|我(?:喜欢|不介意)(?:你)?(?:适当|多)?(?:(?:追问|反问)(?:我)?|问我(?:问题)?|提问))(?:吧|了)?$/.test(plain)) {
       assign('followUp', 'natural')
     }
   }
@@ -163,4 +171,4 @@ function preferenceReminder(values) {
   return parts.length ? `\n\n（已表达的聊天偏好：${parts.join('；')}。我对当前具体问题的要求优先。）` : ''
 }
 
-module.exports = { KEYS, validValue, identityAuthority, explicitIdentityValue, temporaryPreferenceScope, readChatPreferences, extractExplicitPreferences, preferencePrompt, preferenceReminder }
+module.exports = { KEYS, validValue, identityAuthority, explicitIdentityValue, temporaryPreferenceScope, readChatPreferences, chatPreferenceValues, extractExplicitPreferences, preferencePrompt, preferenceReminder }

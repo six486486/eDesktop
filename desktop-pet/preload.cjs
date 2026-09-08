@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('petAPI', {
   listModels: () => ipcRenderer.invoke('pet:models'),
   setModel: (model) => ipcRenderer.invoke('pet:model', model),
   setReminderSound: enabled => ipcRenderer.invoke('pet:reminder-sound', enabled),
+  saveChatPreferences: patch => ipcRenderer.invoke('pet:chat-preferences', patch),
   send: (text) => ipcRenderer.invoke('pet:send', text),
   reset: () => ipcRenderer.invoke('pet:reset'),
   forgetMemories: ids => ipcRenderer.invoke('pet:memory-forget', ids),

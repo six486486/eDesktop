@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto')
 const { performance } = require('node:perf_hooks')
 const { CHAT_SCHEMA, readChatEnvelope } = require('./reply-format.cjs')
 const { REACTION_PROMPT, reactionDecision } = require('./reactions.cjs')
-const { readChatPreferences, extractExplicitPreferences, preferencePrompt, preferenceReminder } = require('./memory.cjs')
+const { KEYS, validValue, readChatPreferences, chatPreferenceValues, extractExplicitPreferences, preferencePrompt, preferenceReminder } = require('./memory.cjs')
 const { reviewSources, extractMemory } = require('./memory-review.cjs')
 const { shouldLimitFollowUps, withoutTrailingQuestions } = require('./follow-up.cjs')
 const { focusPrompt, readFocusEnvelope, focusReply, focusPermission, focusSchema, explicitMinutes } = require('./focus-tools.cjs')
@@ -100,6 +100,7 @@ class PetHarness {
       focus: { ...this.focus }, focusNotice: this.focusNotice ? { ...this.focusNotice } : null,
       reminders: this.reminderTools?.snapshot() || null,
       memory: this.taskMemory?.snapshot() || null,
+      chatPreferences: chatPreferenceValues(this.chatPreferences),
     }
   }
 
@@ -163,6 +164,36 @@ class PetHarness {
     try { this.save() } catch (error) { Object.assign(this, previous); throw error }
     if (patch.model !== undefined || patch.enabled === false) this.cancelMemoryReview('settings-change')
     this.emit()
+  }
+
+  setChatPreferences(patch) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)
+      || Object.keys(patch).some(key => !KEYS.includes(key))) throw new Error('聊天偏好设置无效。')
+    const entries = Object.entries(patch).map(([key, value]) => [key,
+      key === 'preferredName' && typeof value === 'string' ? value.trim() || null : value])
+    for (const [key, value] of entries) {
+      if (!validValue(key, value)) throw new Error(key === 'preferredName'
+        ? '称呼请使用 1–24 个中英文、数字、空格或 _ . · -，也可以留空。' : '请选择有效的聊天偏好。')
+    }
+    if (!entries.length) return chatPreferenceValues(this.chatPreferences)
+    const previous = { chatPreferences: this.chatPreferences, userSequence: this.userSequence }
+    const sourceSequence = ++this.userSequence
+    const sourceMessageId = `settings-${randomUUID()}`, updatedAt = new Date().toISOString()
+    const labels = { preferredName: '用户称呼', replyLength: '回复长短', followUp: '追问方式' }
+    const descriptions = { short: '简短', normal: '正常', detailed: '详细', avoid: '尽量不追问', natural: '自然交流' }
+    this.chatPreferences = { ...this.chatPreferences }
+    for (const [key, value] of entries) this.chatPreferences[key] = {
+      value, sourceMessageId, sourceSequence, updatedAt, method: 'settings',
+      evidence: `在聊天偏好设置中将${labels[key]}设为${key === 'preferredName' ? value ?? '不特意称呼' : descriptions[value]}`,
+    }
+    // Save before cancelling. Source order prevents older chat from replacing a manual edit.
+    try { this.save() } catch (error) {
+      Object.assign(this, previous)
+      throw new Error('聊天偏好未能保存，请检查桌宠数据目录。', { cause: error })
+    }
+    this.cancelMemoryReview('chat-preferences-change')
+    this.emit()
+    return chatPreferenceValues(this.chatPreferences)
   }
 
   async listModels() {

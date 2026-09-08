@@ -39,7 +39,7 @@ app.whenReady().then(async () => {
   pet = createDesktopPet({ dataDirectory, focusHost: host })
   let chat = await openChat()
   assert.equal((await read(chat)).reminderSoundEnabled, true)
-  await evaluate(chat, 'document.querySelector("[aria-label=天气与提醒]").click()')
+  await evaluate(chat, 'document.querySelector("[aria-label=小栖设置]").click()')
   await until(() => evaluate(chat, 'Boolean(document.querySelector("[aria-label=提醒喵声]"))'))
   await evaluate(chat, 'document.querySelector("[aria-label=提醒喵声]").click()')
   await until(async () => (await read(chat)).reminderSoundEnabled === false)

@@ -216,11 +216,11 @@ function Chat() {
       <header className="chat-header">
         <div className="chat-avatar"><Mascot mood={['requesting', 'recording'].includes(state.voice?.phase || '') ? 'listening' : reaction?.kind ?? (state.busy ? 'thinking' : 'idle')} meowing={state.meowing} level={state.voice?.level} /></div>
         <div className="chat-heading"><h1>小栖</h1><p>{state.busy ? waitingText : state.focus?.running ? '陪你专注中。' : '在这儿，慢慢聊。'}</p></div>
-        {state.reminders && <button className={`icon-button reminder-entry${settingsOpen ? ' is-active' : ''}`} aria-label="天气与提醒" title="天气与提醒" aria-expanded={settingsOpen} onClick={() => { voiceInput.cancel(); setSettingsOpen(value => !value) }}><BellRing size={17} strokeWidth={1.8} /></button>}
+        {state.reminders && <button className={`icon-button reminder-entry${settingsOpen ? ' is-active' : ''}`} aria-label="小栖设置" title="小栖设置" aria-expanded={settingsOpen} onClick={() => { voiceInput.cancel(); setSettingsOpen(value => !value) }}><BellRing size={17} strokeWidth={1.8} /></button>}
         <button className="icon-button" aria-label="重新聊" title="清空当前对话" onClick={() => void reset()}><RotateCcw size={15} /></button>
         <button className="icon-button" aria-label="收起聊天" title="收起聊天（Esc）" onClick={() => api?.closeChat()}><X size={17} /></button>
       </header>
-      {settingsOpen && state.reminders ? <ReminderSettings settings={state.reminders} memory={state.memory} soundEnabled={state.reminderSoundEnabled !== false} onClose={() => setSettingsOpen(false)} /> : <>
+      {settingsOpen && state.reminders ? <ReminderSettings settings={state.reminders} memory={state.memory} chatPreferences={state.chatPreferences} soundEnabled={state.reminderSoundEnabled !== false} onClose={() => setSettingsOpen(false)} /> : <>
       <div className="chat-history" ref={scroll} role="log" aria-label="聊天记录">
         {state.messages.length === 0 && !state.busy && <div className="chat-empty"><Mascot /><p>小栖在呢，想聊什么呀？</p></div>}
         {state.messages.map((message) => <div key={message.id} className={`chat-message message-${message.role}`}>

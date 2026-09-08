@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { ArrowLeft, BellRing, Search, Volume2 } from 'lucide-react'
-import type { PetMemory, PetReminders, WeatherCity } from './types'
+import type { ChatPreferences, PetMemory, PetReminders, WeatherCity } from './types'
 import { createMeowPlayer } from './reminder-sound'
 import { MemoryEntry, MemoryPanel } from './memory-panel'
+import { ChatPreferenceEntry, ChatPreferencePanel } from './chat-preferences'
 
-export function ReminderSettings({ settings, soundEnabled, memory, onClose }: { settings: PetReminders; soundEnabled: boolean; memory?: PetMemory | null; onClose: () => void }) {
+export function ReminderSettings({ settings, soundEnabled, memory, chatPreferences, onClose }: { settings: PetReminders; soundEnabled: boolean; memory?: PetMemory | null; chatPreferences?: ChatPreferences; onClose: () => void }) {
   const [memoryOpen, setMemoryOpen] = useState(false)
+  const [preferencesOpen, setPreferencesOpen] = useState(false)
   const [soundBusy, setSoundBusy] = useState(false)
   const player = useRef<ReturnType<typeof createMeowPlayer> | null>(null)
   useEffect(() => () => { player.current?.stop(); player.current = null }, [])
@@ -53,8 +55,10 @@ export function ReminderSettings({ settings, soundEnabled, memory, onClose }: { 
     finally { setBusy(false) }
   }
   if (memoryOpen && memory) return <MemoryPanel memory={memory} onBack={() => setMemoryOpen(false)} />
-  return <section className="reminder-settings" aria-label="天气与提醒设置">
-    <div className="reminder-settings-heading"><button className="icon-button" aria-label="返回聊天" onClick={onClose}><ArrowLeft size={16} /></button><strong>天气与提醒</strong><BellRing size={19} strokeWidth={1.8} /></div>
+  if (preferencesOpen) return <ChatPreferencePanel preferences={chatPreferences} onBack={() => setPreferencesOpen(false)} />
+  return <section className="reminder-settings" aria-label="小栖设置">
+    <div className="reminder-settings-heading"><button className="icon-button" aria-label="返回聊天" onClick={onClose}><ArrowLeft size={16} /></button><strong>小栖设置</strong><BellRing size={19} strokeWidth={1.8} /></div>
+    <ChatPreferenceEntry onClick={() => setPreferencesOpen(true)} />
     {memory && <MemoryEntry count={memory.habits.length} onClick={() => setMemoryOpen(true)} />}
     <div className="reminder-sound-setting">
       <div><strong>提醒声音</strong><small>到时间，轻轻喵一声。</small></div>

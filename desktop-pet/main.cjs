@@ -270,6 +270,7 @@ function createDesktopPet({ dataDirectory = path.join(app.getPath('userData'), '
   handle('pet:models', () => harness.listModels())
   handle('pet:model', (model) => { dismissVoice(); harness.setPreferences({ model }); void harness.warmModel() })
   handle('pet:reminder-sound', enabled => harness.setPreferences({ reminderSoundEnabled: enabled }))
+  handle('pet:chat-preferences', patch => harness.setChatPreferences(patch))
   handle('pet:send', (text) => { dismissVoice(); return harness.start(text) })
   handle('pet:reset', () => resetChat())
   handle('pet:memory-forget', async ids => {

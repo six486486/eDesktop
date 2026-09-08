@@ -21,6 +21,7 @@ export interface PetState {
   focusNotice?: { id: string; text: string; expiresAt: number } | null
   reminders?: PetReminders | null
   memory?: PetMemory | null
+  chatPreferences?: ChatPreferences
   voice?: VoiceState
   voiceBubble?: { id: string; phase: VoiceState['phase'] | 'thinking' | 'reply' | 'error'; text?: string; transcript?: string } | null
   meowing?: boolean
@@ -42,6 +43,11 @@ export interface VoiceState {
 }
 
 export interface WeatherCity { id: string; name: string; label: string }
+export interface ChatPreferences {
+  preferredName: string | null
+  replyLength: 'short' | 'normal' | 'detailed'
+  followUp: 'avoid' | 'natural'
+}
 export interface PetMemoryEntry {
   id: string
   label: string
@@ -67,6 +73,7 @@ export interface PetAPI {
   listModels: () => Promise<string[]>
   setModel: (model: string) => Promise<void>
   setReminderSound: (enabled: boolean) => Promise<void>
+  saveChatPreferences: (patch: Partial<ChatPreferences>) => Promise<ChatPreferences>
   send: (text: string) => Promise<void>
   reset: () => Promise<PetState>
   forgetMemories: (ids: string[]) => Promise<PetMemory>
